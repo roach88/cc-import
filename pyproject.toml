@@ -60,4 +60,9 @@ python-version = "3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# import-mode=importlib bypasses pytest's __init__.py-based package detection.
+# Required because the plugin's __init__.py at the repo root would otherwise
+# make pytest treat the whole tree as a package, causing test collection to
+# try importing __init__.py directly (which fails on its `from . import cli`
+# relative import without a parent package).
+addopts = "-q --import-mode=importlib"

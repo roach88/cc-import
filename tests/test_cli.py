@@ -11,7 +11,6 @@ import argparse
 import importlib.util
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -19,22 +18,13 @@ import pytest
 
 def _load_plugin_init():
     repo_root = Path(__file__).resolve().parents[1]
-    plugin_dir = repo_root
-    spec = importlib.util.spec_from_file_location(
-        "hermes_plugins.cc_import",
-        plugin_dir / "__init__.py",
-        submodule_search_locations=[str(plugin_dir)],
-    )
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    spec = importlib.util.spec_from_file_location("cc_import_plugin", repo_root / "__init__.py")
     assert spec is not None
     assert spec.loader is not None
-    if "hermes_plugins" not in sys.modules:
-        ns = types.ModuleType("hermes_plugins")
-        ns.__path__ = []
-        sys.modules["hermes_plugins"] = ns
     mod = importlib.util.module_from_spec(spec)
-    mod.__package__ = "hermes_plugins.cc_import"
-    mod.__path__ = [str(plugin_dir)]
-    sys.modules["hermes_plugins.cc_import"] = mod
+    sys.modules["cc_import_plugin"] = mod
     spec.loader.exec_module(mod)
     return mod
 
