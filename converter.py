@@ -7,10 +7,18 @@ plugin (36 skills + 48 agents) into a local Hermes install on 2026-04-25.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 
@@ -156,3 +164,92 @@ def build_delegation_skill(
         f"{cc_body.lstrip()}"
     )
     return render_frontmatter(new_fm, body)
+
+
+# ---------------------------------------------------------------------------
+# Hash helpers
+# ---------------------------------------------------------------------------
+
+
+def sha256_bytes(data: bytes) -> str:
+    """Return the SHA-256 hex digest of *data*."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 hex digest of *path*'s bytes.
+
+    Reads the file in binary mode so line-ending differences (CRLF vs LF)
+    produce different hashes — load-bearing for the manifest's
+    user-modified detection.
+    """
+    return sha256_bytes(path.read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Manifest I/O
+# ---------------------------------------------------------------------------
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    """Load the per-plugin state manifest, or return ``{}`` if missing or corrupt.
+
+    Corrupt JSON is treated as an empty manifest with a warning, so a
+    botched on-disk state file does not crash the next sync — the next save
+    will overwrite it.
+    """
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("Manifest at %s is corrupt — treating as empty", path)
+        return {}
+
+
+def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """Write *manifest* to *path* as deterministic, diff-friendly JSON.
+
+    Creates parent directories if missing. Output uses ``indent=2`` and
+    ``sort_keys=True`` so successive saves produce stable diffs.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+# ---------------------------------------------------------------------------
+# Git
+# ---------------------------------------------------------------------------
+
+
+def clone_or_update(url: str, branch: str, dest: Path) -> None:
+    """Clone *url*@*branch* into *dest*, or fetch + reset if already cloned.
+
+    Three cases:
+      - ``dest`` does not exist → ``git clone --depth=1 --branch <branch>``
+      - ``dest`` is an existing checkout (has ``.git/``) → ``git fetch`` +
+        ``git reset --hard origin/<branch>`` to align with upstream
+      - ``dest`` exists but is not a git checkout → removed first, then
+        cloned (anything inside is discarded — the clone workspace is owned
+        by the caller and should not contain user data)
+    """
+    if dest.exists() and (dest / ".git").exists():
+        logger.info("Updating plugin repo at %s", dest)
+        subprocess.run(
+            ["git", "-C", str(dest), "fetch", "--depth=1", "origin", branch],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(dest), "reset", "--hard", f"origin/{branch}"],
+            check=True,
+        )
+        return
+    if dest.exists():
+        logger.info("Removing non-git dir at %s before clone", dest)
+        shutil.rmtree(dest)
+    logger.info("Cloning %s@%s → %s", url, branch, dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--depth=1", "--branch", branch, url, str(dest)],
+        check=True,
+    )
