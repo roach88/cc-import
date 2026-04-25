@@ -480,3 +480,370 @@ class TestCloneOrUpdate:
         dest = tmp_path / "dest"
         with pytest.raises(subprocess.CalledProcessError):
             _CONVERTER.clone_or_update(f"file://{bare_upstream}", "nonexistent-branch", dest)
+
+
+def _make_src_skill(root: Path, name: str = "myskill", body: str = "skill body content") -> Path:
+    """Create a fixture source skill dir with a SKILL.md inside."""
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n---\n{body}")
+    return d
+
+
+def _make_src_agent(
+    parent: Path,
+    name: str = "myagent",
+    description: str = "Do stuff",
+    tools: str = "Read,Bash",
+    body: str = "you are an agent",
+) -> Path:
+    """Create a fixture source agent ``.md`` file."""
+    parent.mkdir(parents=True, exist_ok=True)
+    agent_md = parent / f"{name}.md"
+    agent_md.write_text(
+        f"---\nname: {name}\ndescription: {description}\ntools: {tools}\n---\n{body}"
+    )
+    return agent_md
+
+
+class TestMigrateSkill:
+    """``migrate_skill(src_skill_dir, dest_skill_dir, manifest, plugin, skills_dir)``.
+
+    The 3-hash decision matrix governs all branches:
+
+    | local==origin | local==prior_origin | Action |
+    |---|---|---|
+    | true | (any) | UNCHANGED, refresh manifest |
+    | false | true | COPY (upstream updated, user clean) |
+    | false | false | SKIP with warning (user-modified) |
+    """
+
+    def test_happy_path_first_write_records_manifest_entry(self, tmp_path):
+        src = _make_src_skill(tmp_path / "src", "s", "body v1")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "s"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        assert (dest / "SKILL.md").exists()
+        assert "plug/s" in manifest
+        entry = manifest["plug/s"]
+        assert entry["plugin"] == "plug"
+        assert entry["kind"] == "skill"
+        assert entry["origin_hash"] == _CONVERTER.sha256_file(src / "SKILL.md")
+
+    def test_copies_whole_tree_not_just_skill_md(self, tmp_path):
+        src = tmp_path / "src" / "s"
+        src.mkdir(parents=True)
+        (src / "SKILL.md").write_text("---\nname: s\n---\nbody")
+        (src / "helper.py").write_text("def x(): pass")
+        (src / "subdir").mkdir()
+        (src / "subdir" / "data.json").write_text("{}")
+
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "s"
+        _CONVERTER.migrate_skill(src, dest, {}, "plug", skills_dir)
+
+        assert (dest / "SKILL.md").exists()
+        assert (dest / "helper.py").exists()
+        assert (dest / "subdir" / "data.json").exists()
+
+    def test_idempotent_rerun_does_not_rewrite(self, tmp_path):
+        src = _make_src_skill(tmp_path / "src", "s", "body")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "s"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+        mtime_before = (dest / "SKILL.md").stat().st_mtime_ns
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+        mtime_after = (dest / "SKILL.md").stat().st_mtime_ns
+
+        assert mtime_before == mtime_after
+
+    def test_upstream_update_propagates(self, tmp_path):
+        src = _make_src_skill(tmp_path / "src", "s", "v1")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "s"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        (src / "SKILL.md").write_text("---\nname: s\n---\nv2 from upstream")
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        assert "v2 from upstream" in (dest / "SKILL.md").read_text()
+        assert manifest["plug/s"]["origin_hash"] == _CONVERTER.sha256_file(src / "SKILL.md")
+
+    def test_user_modified_skill_preserved_with_warning(self, tmp_path, caplog):
+        import logging
+
+        src = _make_src_skill(tmp_path / "src", "s", "v1")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "s"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        (dest / "SKILL.md").write_text("---\nname: s\n---\nuser-edited content")
+        (src / "SKILL.md").write_text("---\nname: s\n---\nv2 from upstream")
+
+        with caplog.at_level(logging.WARNING):
+            _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        assert "user-edited content" in (dest / "SKILL.md").read_text()
+        assert any(
+            "SKIP" in rec.message and "user-modified" in rec.message.lower()
+            for rec in caplog.records
+        )
+
+    def test_skill_dir_without_skill_md_is_skipped(self, tmp_path):
+        src = tmp_path / "src" / "notaskill"
+        src.mkdir(parents=True)
+        (src / "random.txt").write_text("not a skill")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "notaskill"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_skill(src, dest, manifest, "plug", skills_dir)
+
+        assert not dest.exists()
+        assert manifest == {}
+
+
+class TestMigrateAgent:
+    """``migrate_agent(src_agent_md, dest_skill_dir, manifest, plugin, skills_dir)``.
+
+    Translates a Claude Code agent markdown file to a Hermes delegation skill
+    SKILL.md at ``<skills_dir>/<plugin>/agents/<agent_name>/SKILL.md``. Same
+    3-hash decision matrix as :class:`TestMigrateSkill` for idempotent
+    handling, but ``origin_hash`` is computed over the *translated* output —
+    so a change in build_delegation_skill's logic would also invalidate.
+    """
+
+    def test_happy_path_translates_to_delegation_skill(self, tmp_path):
+        src = _make_src_agent(
+            tmp_path / "src" / "agents",
+            name="myagent",
+            description="Audit security",
+            tools="Read,Bash",
+            body="You are an auditor.",
+        )
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "myagent"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+
+        dest_md = dest / "SKILL.md"
+        assert dest_md.exists()
+        fm, body = _CONVERTER.parse_frontmatter(dest_md.read_text())
+        assert fm["name"] == "plug/agent/myagent"
+        assert fm["description"] == "Audit security"
+        assert fm["metadata"]["hermes"]["toolsets"] == ["file", "terminal"]
+        assert fm["metadata"]["hermes"]["source_kind"] == "agent"
+        assert fm["metadata"]["hermes"]["upstream_name"] == "myagent"
+        assert "## Persona" in body
+        assert "You are an auditor." in body
+        # Manifest entry recorded with kind=agent
+        key = "plug/agents/myagent"
+        assert key in manifest
+        assert manifest[key]["kind"] == "agent"
+
+    def test_agent_without_name_frontmatter_uses_filename_stem(self, tmp_path):
+        agent_md = tmp_path / "src" / "filename-stem.md"
+        agent_md.parent.mkdir(parents=True)
+        agent_md.write_text("---\ndescription: x\ntools: Read\n---\nbody")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "filename-stem"
+
+        _CONVERTER.migrate_agent(agent_md, dest, {}, "plug", skills_dir)
+
+        fm, _ = _CONVERTER.parse_frontmatter((dest / "SKILL.md").read_text())
+        assert fm["name"] == "plug/agent/filename-stem"
+
+    def test_agent_without_frontmatter_still_produces_output(self, tmp_path):
+        agent_md = tmp_path / "src" / "noname.md"
+        agent_md.parent.mkdir(parents=True)
+        agent_md.write_text("just body, no frontmatter")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "noname"
+
+        _CONVERTER.migrate_agent(agent_md, dest, {}, "plug", skills_dir)
+
+        assert (dest / "SKILL.md").exists()
+        fm, _ = _CONVERTER.parse_frontmatter((dest / "SKILL.md").read_text())
+        # Defaults: filename stem for name, default toolsets for tools
+        assert fm["name"] == "plug/agent/noname"
+        assert fm["metadata"]["hermes"]["toolsets"] == ["file", "web"]
+
+    def test_idempotent_rerun_does_not_rewrite(self, tmp_path):
+        src = _make_src_agent(tmp_path / "src", "a", "d", "Read", "body")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "a"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+        mtime_before = (dest / "SKILL.md").stat().st_mtime_ns
+
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+        mtime_after = (dest / "SKILL.md").stat().st_mtime_ns
+
+        assert mtime_before == mtime_after
+
+    def test_upstream_update_propagates(self, tmp_path):
+        src = _make_src_agent(tmp_path / "src", "a", "d", "Read", "v1 body")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "a"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+
+        src.write_text("---\nname: a\ndescription: d\ntools: Read\n---\nv2 body")
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+
+        _, body = _CONVERTER.parse_frontmatter((dest / "SKILL.md").read_text())
+        assert "v2 body" in body
+
+    def test_user_modified_agent_preserved_with_warning(self, tmp_path, caplog):
+        import logging
+
+        src = _make_src_agent(tmp_path / "src", "a", "d", "Read", "v1")
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "agents" / "a"
+        manifest: dict = {}
+
+        _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+
+        (dest / "SKILL.md").write_text("user-edited content")
+        src.write_text("---\nname: a\ndescription: new\ntools: Read\n---\nv2")
+
+        with caplog.at_level(logging.WARNING):
+            _CONVERTER.migrate_agent(src, dest, manifest, "plug", skills_dir)
+
+        assert (dest / "SKILL.md").read_text() == "user-edited content"
+        assert any(
+            "SKIP" in rec.message and "user-modified" in rec.message.lower()
+            for rec in caplog.records
+        )
+
+
+class TestPruneRemoved:
+    """``prune_removed(plugin, seen_keys, manifest, skills_dir)``.
+
+    Removes manifest entries (and their on-disk files) for skills that are no
+    longer present in upstream. Protects user-modified files from deletion by
+    comparing the on-disk hash against the manifest's last-known origin hash.
+    """
+
+    def test_removes_stale_unmodified_entry(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "stale"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("content")
+        origin_hash = _CONVERTER.sha256_file(dest / "SKILL.md")
+        manifest: dict = {
+            "plug/stale": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": "irrelevant",
+                "origin_hash": origin_hash,
+            }
+        }
+
+        _CONVERTER.prune_removed("plug", set(), manifest, skills_dir)
+
+        assert not dest.exists()
+        assert "plug/stale" not in manifest
+
+    def test_keeps_user_modified_stale_entry_with_warning(self, tmp_path, caplog):
+        import logging
+
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "stale"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("user-edited")
+        # origin_hash is the hash of DIFFERENT content — user has since edited
+        manifest: dict = {
+            "plug/stale": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": "x",
+                "origin_hash": _CONVERTER.sha256_bytes(b"original-upstream-content"),
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            _CONVERTER.prune_removed("plug", set(), manifest, skills_dir)
+
+        assert (dest / "SKILL.md").exists()
+        assert (dest / "SKILL.md").read_text() == "user-edited"
+        assert any("KEEP" in rec.message for rec in caplog.records)
+        # Manifest entry retained so a future rerun still tracks it
+        assert "plug/stale" in manifest
+
+    def test_stale_entry_with_missing_file_removed_cleanly(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        manifest: dict = {
+            "plug/missing": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": "x",
+                "origin_hash": "abc",
+            }
+        }
+
+        _CONVERTER.prune_removed("plug", set(), manifest, skills_dir)
+
+        assert "plug/missing" not in manifest
+
+    def test_does_not_touch_other_plugin_entries(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        d1 = skills_dir / "plug1" / "x"
+        d1.mkdir(parents=True)
+        (d1 / "SKILL.md").write_text("c1")
+        d2 = skills_dir / "plug2" / "y"
+        d2.mkdir(parents=True)
+        (d2 / "SKILL.md").write_text("c2")
+
+        manifest: dict = {
+            "plug1/x": {
+                "plugin": "plug1",
+                "kind": "skill",
+                "source_path": "a",
+                "origin_hash": _CONVERTER.sha256_file(d1 / "SKILL.md"),
+            },
+            "plug2/y": {
+                "plugin": "plug2",
+                "kind": "skill",
+                "source_path": "b",
+                "origin_hash": _CONVERTER.sha256_file(d2 / "SKILL.md"),
+            },
+        }
+
+        _CONVERTER.prune_removed("plug1", set(), manifest, skills_dir)
+
+        assert "plug1/x" not in manifest
+        assert "plug2/y" in manifest
+        assert d2.exists()
+
+    def test_seen_keys_protect_entries_from_pruning(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        dest = skills_dir / "plug" / "still-here"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("c")
+        manifest: dict = {
+            "plug/still-here": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": "x",
+                "origin_hash": _CONVERTER.sha256_file(dest / "SKILL.md"),
+            }
+        }
+
+        _CONVERTER.prune_removed("plug", {"plug/still-here"}, manifest, skills_dir)
+
+        assert "plug/still-here" in manifest
+        assert dest.exists()
