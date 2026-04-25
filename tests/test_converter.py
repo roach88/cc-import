@@ -847,3 +847,197 @@ class TestPruneRemoved:
 
         assert "plug/still-here" in manifest
         assert dest.exists()
+
+
+@pytest.fixture
+def bare_cc_plugin(tmp_path, bare_upstream):
+    """Bare git repo with a CC-shaped plugin already committed.
+
+    Layout (committed on ``main``):
+
+        plugin.json               {"name": "fixture-plugin", "version": "1.0.0"}
+        skills/alpha/SKILL.md
+        skills/beta/SKILL.md
+        agents/gamma.md           (frontmatter declares Read,Bash tools)
+    """
+    work = tmp_path / "cc-plugin-work"
+    subprocess.run(
+        ["git", "clone", f"file://{bare_upstream}", str(work)],
+        check=True,
+        capture_output=True,
+    )
+    (work / "plugin.json").write_text('{"name": "fixture-plugin", "version": "1.0.0"}\n')
+    (work / "skills" / "alpha").mkdir(parents=True)
+    (work / "skills" / "alpha" / "SKILL.md").write_text("---\nname: alpha\n---\nalpha v1")
+    (work / "skills" / "beta").mkdir(parents=True)
+    (work / "skills" / "beta" / "SKILL.md").write_text("---\nname: beta\n---\nbeta v1")
+    (work / "agents").mkdir()
+    (work / "agents" / "gamma.md").write_text(
+        "---\nname: gamma\ndescription: Gamma agent\ntools: Read,Bash\n---\nYou are gamma."
+    )
+    _git_in(work, "config", "user.email", "test@example.com")
+    _git_in(work, "config", "user.name", "Test")
+    _git_in(work, "add", "plugin.json", "skills", "agents")
+    _git_in(work, "commit", "-m", "add cc plugin content")
+    _git_in(work, "push", "origin", "main")
+    return bare_upstream
+
+
+def _push_upstream_change(bare: Path, tmp_path: Path, label: str, mutator) -> None:
+    """Clone ``bare`` into a scratch worktree, apply *mutator(work_dir)*, push back."""
+    work = tmp_path / f"upstream-edit-{label}"
+    subprocess.run(["git", "clone", f"file://{bare}", str(work)], check=True, capture_output=True)
+    _git_in(work, "config", "user.email", "test@example.com")
+    _git_in(work, "config", "user.name", "Test")
+    mutator(work)
+    _git_in(work, "add", "-A")
+    _git_in(work, "commit", "-m", f"upstream edit: {label}")
+    _git_in(work, "push", "origin", "main")
+
+
+class TestImportPlugin:
+    """``import_plugin(git_url, *, branch, subdir, hermes_home) -> ImportSummary``.
+
+    End-to-end orchestrator that ties clone_or_update, migrate_skill,
+    migrate_agent, prune_removed, and manifest IO together. Tests run against
+    real bare git repos in tmp_path.
+    """
+
+    def test_happy_path_imports_skills_and_translates_agents(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        summary = _CONVERTER.import_plugin(f"file://{bare_cc_plugin}", hermes_home=hermes_home)
+        assert summary.plugin == "fixture-plugin"
+        assert summary.skills_imported == 2
+        assert summary.skills_unchanged == 0
+        assert summary.agents_translated == 1
+        assert summary.agents_unchanged == 0
+        assert summary.skipped_user_modified == []
+
+        plugin_skills = hermes_home / "skills" / "fixture-plugin"
+        assert (plugin_skills / "alpha" / "SKILL.md").exists()
+        assert (plugin_skills / "beta" / "SKILL.md").exists()
+        # Agent translated to delegation skill
+        agent_skill = plugin_skills / "agents" / "gamma" / "SKILL.md"
+        assert agent_skill.exists()
+        fm, body = _CONVERTER.parse_frontmatter(agent_skill.read_text())
+        assert fm["name"] == "fixture-plugin/agent/gamma"
+        assert fm["metadata"]["hermes"]["toolsets"] == ["file", "terminal"]
+        assert "You are gamma." in body
+        # Manifest persisted
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        assert manifest_path.exists()
+        manifest = _CONVERTER.load_manifest(manifest_path)
+        assert "fixture-plugin/alpha" in manifest
+        assert "fixture-plugin/beta" in manifest
+        assert "fixture-plugin/agents/gamma" in manifest
+
+    def test_idempotent_rerun_does_not_rewrite(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        plugin_root = hermes_home / "skills" / "fixture-plugin"
+        mtimes = {p: p.stat().st_mtime_ns for p in plugin_root.rglob("SKILL.md")}
+
+        s2 = _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        for p, mt in mtimes.items():
+            assert p.stat().st_mtime_ns == mt
+        assert s2.skills_imported == 0
+        assert s2.skills_unchanged == 2
+        assert s2.agents_translated == 0
+        assert s2.agents_unchanged == 1
+
+    def test_upstream_skill_update_propagates(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        def edit_alpha(work: Path) -> None:
+            (work / "skills" / "alpha" / "SKILL.md").write_text(
+                "---\nname: alpha\n---\nalpha v2 updated"
+            )
+
+        _push_upstream_change(bare_cc_plugin, tmp_path, "alpha-v2", edit_alpha)
+        s2 = _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        alpha_md = hermes_home / "skills" / "fixture-plugin" / "alpha" / "SKILL.md"
+        assert "alpha v2 updated" in alpha_md.read_text()
+        assert s2.skills_imported == 1
+        assert s2.skills_unchanged == 1  # beta still unchanged
+
+    def test_user_modified_agent_reported_in_summary(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        gamma_md = hermes_home / "skills" / "fixture-plugin" / "agents" / "gamma" / "SKILL.md"
+        gamma_md.write_text("user-edited content")
+
+        def update_gamma(work: Path) -> None:
+            (work / "agents" / "gamma.md").write_text(
+                "---\nname: gamma\ndescription: Updated\ntools: Read\n---\nupdated upstream body"
+            )
+
+        _push_upstream_change(bare_cc_plugin, tmp_path, "gamma-v2", update_gamma)
+        s2 = _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        # User edit preserved
+        assert gamma_md.read_text() == "user-edited content"
+        # Summary reports the skip
+        assert "fixture-plugin/agents/gamma" in s2.skipped_user_modified
+
+    def test_explicit_hermes_home_overrides_env_var(self, tmp_path, bare_cc_plugin, monkeypatch):
+        env_home = tmp_path / "env-home"
+        monkeypatch.setenv("HERMES_HOME", str(env_home))
+        explicit_home = tmp_path / "explicit-home"
+
+        _CONVERTER.import_plugin(f"file://{bare_cc_plugin}", hermes_home=explicit_home)
+
+        assert (explicit_home / "skills" / "fixture-plugin" / "alpha").exists()
+        # env_home was untouched
+        assert not (env_home / "skills").exists()
+
+    def test_subdir_support(self, tmp_path, bare_upstream):
+        # Build upstream with content nested under plugins/nested-plugin/
+        def build(work: Path) -> None:
+            nested = work / "plugins" / "nested-plugin"
+            nested.mkdir(parents=True)
+            (nested / "plugin.json").write_text('{"name": "nested-plugin"}\n')
+            (nested / "skills" / "x").mkdir(parents=True)
+            (nested / "skills" / "x" / "SKILL.md").write_text("---\nname: x\n---\nx body")
+
+        _push_upstream_change(bare_upstream, tmp_path, "nested", build)
+
+        hermes_home = tmp_path / "alt-hermes"
+        summary = _CONVERTER.import_plugin(
+            f"file://{bare_upstream}",
+            subdir="plugins/nested-plugin",
+            hermes_home=hermes_home,
+        )
+        assert summary.plugin == "nested-plugin"
+        assert (hermes_home / "skills" / "nested-plugin" / "x" / "SKILL.md").exists()
+
+    def test_plugin_name_falls_back_to_url_basename_when_no_plugin_json(
+        self, tmp_path, bare_upstream
+    ):
+        def build(work: Path) -> None:
+            (work / "skills" / "s").mkdir(parents=True)
+            (work / "skills" / "s" / "SKILL.md").write_text("---\nname: s\n---\nbody")
+
+        _push_upstream_change(bare_upstream, tmp_path, "noname", build)
+
+        hermes_home = tmp_path / "alt-hermes"
+        summary = _CONVERTER.import_plugin(f"file://{bare_upstream}", hermes_home=hermes_home)
+        # bare_upstream's path is tmp_path/upstream.git → basename "upstream.git"
+        # → ".git" stripped → "upstream"
+        assert summary.plugin == "upstream"
+
+    def test_invalid_branch_raises_called_process_error(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        with pytest.raises(subprocess.CalledProcessError):
+            _CONVERTER.import_plugin(
+                f"file://{bare_cc_plugin}",
+                branch="nonexistent-branch",
+                hermes_home=hermes_home,
+            )
