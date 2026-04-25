@@ -136,3 +136,81 @@ class TestRenderFrontmatter:
         assert "metadata:" in rendered
         assert "hermes:" in rendered
         assert "toolsets:" in rendered
+
+
+class TestTranslateTools:
+    """``translate_tools(cc_tools) -> (hermes_toolsets, unknown_names)``.
+
+    Maps Claude Code tool names to Hermes coarse toolsets:
+      - ``file``: Read, Grep, Glob, Edit, Write, NotebookEdit
+      - ``terminal``: Bash
+      - ``web``: WebFetch, WebSearch
+    Drops ``Task`` silently (Hermes sub-agents cannot delegate further).
+    Returns ``["file", "web"]`` as the default toolset list when the input is
+    empty/missing or when no provided tool name maps to a known toolset.
+    """
+
+    def test_happy_path_list_of_known_tools(self):
+        toolsets, unknown = _CONVERTER.translate_tools(["Read", "Grep", "Bash"])
+        # Read + Grep both map to "file" — should appear once
+        assert toolsets == ["file", "terminal"]
+        assert unknown == []
+
+    def test_none_returns_default(self):
+        toolsets, unknown = _CONVERTER.translate_tools(None)
+        assert toolsets == ["file", "web"]
+        assert unknown == []
+
+    def test_empty_string_returns_default(self):
+        toolsets, unknown = _CONVERTER.translate_tools("")
+        assert toolsets == ["file", "web"]
+        assert unknown == []
+
+    def test_empty_list_returns_default(self):
+        toolsets, unknown = _CONVERTER.translate_tools([])
+        assert toolsets == ["file", "web"]
+        assert unknown == []
+
+    def test_comma_separated_string_input(self):
+        toolsets, unknown = _CONVERTER.translate_tools("Read, Bash, WebSearch")
+        assert toolsets == ["file", "terminal", "web"]
+        assert unknown == []
+
+    def test_task_is_dropped_silently_not_reported_unknown(self):
+        toolsets, unknown = _CONVERTER.translate_tools(["Read", "Task"])
+        assert toolsets == ["file"]
+        # Task is in TOOL_DROP — neither registered as a toolset nor reported
+        # as unknown. The contract: known-but-skipped, not unknown.
+        assert unknown == []
+
+    def test_unknown_tool_reported(self):
+        toolsets, unknown = _CONVERTER.translate_tools(["Read", "MagicTool"])
+        assert toolsets == ["file"]
+        assert unknown == ["MagicTool"]
+
+    def test_all_unknown_falls_back_to_default_toolsets(self):
+        toolsets, unknown = _CONVERTER.translate_tools(["Magic", "Mystery"])
+        assert toolsets == ["file", "web"]
+        assert sorted(unknown) == ["Magic", "Mystery"]
+
+    def test_invalid_type_returns_default(self):
+        toolsets, unknown = _CONVERTER.translate_tools(123)  # type: ignore[arg-type]
+        assert toolsets == ["file", "web"]
+        assert unknown == []
+
+    def test_file_toolset_deduped_across_all_file_tools(self):
+        toolsets, unknown = _CONVERTER.translate_tools(
+            ["Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit"]
+        )
+        assert toolsets == ["file"]
+        assert unknown == []
+
+    def test_all_three_toolsets_in_one_call(self):
+        toolsets, unknown = _CONVERTER.translate_tools(["Read", "Bash", "WebSearch"])
+        assert sorted(toolsets) == ["file", "terminal", "web"]
+        assert unknown == []
+
+    def test_whitespace_trimmed_in_comma_separated_input(self):
+        toolsets, unknown = _CONVERTER.translate_tools("  Read  ,  Bash  ")
+        assert toolsets == ["file", "terminal"]
+        assert unknown == []
