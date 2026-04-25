@@ -14,6 +14,30 @@ import yaml
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 
+# Claude Code tool name → Hermes toolset. Covers the common CC tools;
+# unknowns are reported, not dropped. Extend as upstream plugins reveal new
+# tools. Ports verbatim from plugin_sync.py.
+TOOL_MAP: dict[str, str] = {
+    "Read": "file",
+    "Grep": "file",
+    "Glob": "file",
+    "Edit": "file",
+    "Write": "file",
+    "NotebookEdit": "file",
+    "Bash": "terminal",
+    "WebFetch": "web",
+    "WebSearch": "web",
+}
+
+# Tools dropped silently — present in source CC plugins but not actionable in
+# Hermes. ``Task`` is dropped because Hermes sub-agents (delegation skills)
+# cannot delegate further.
+TOOL_DROP: set[str] = {"Task"}
+
+# Default toolsets used when (a) the source has no `tools:` declared, or
+# (b) every declared tool is unknown to TOOL_MAP. Matches plugin_sync.py.
+_DEFAULT_TOOLSETS: list[str] = ["file", "web"]
+
 
 def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     """Split a markdown-with-frontmatter document into (frontmatter, body).
@@ -43,3 +67,42 @@ def render_frontmatter(fm: dict[str, Any], body: str) -> str:
     """
     fm_yaml = yaml.safe_dump(fm, sort_keys=False).strip()
     return f"---\n{fm_yaml}\n---\n\n{body.lstrip()}"
+
+
+def translate_tools(cc_tools: Any) -> tuple[list[str], list[str]]:
+    """Map Claude Code tool names to Hermes toolsets.
+
+    Returns ``(hermes_toolsets, unknown_tool_names)``. Inputs:
+      - ``None`` / empty string / empty list / unexpected type: default fallback
+      - comma-separated string: split, trim, translate
+      - list of strings: translate
+
+    Tools in :data:`TOOL_DROP` are silently skipped. Tools not in
+    :data:`TOOL_MAP` are returned in the unknown list. When no input tool
+    maps to a known toolset, the default ``["file", "web"]`` is returned so
+    the resulting agent has at least the most common toolsets available.
+    """
+    if not cc_tools:
+        return list(_DEFAULT_TOOLSETS), []
+
+    if isinstance(cc_tools, str):
+        names = [t.strip() for t in cc_tools.split(",") if t.strip()]
+    elif isinstance(cc_tools, list):
+        names = [str(t).strip() for t in cc_tools]
+    else:
+        return list(_DEFAULT_TOOLSETS), []
+
+    toolsets: list[str] = []
+    unknown: list[str] = []
+    for name in names:
+        if name in TOOL_DROP:
+            continue
+        mapped = TOOL_MAP.get(name)
+        if mapped:
+            if mapped not in toolsets:
+                toolsets.append(mapped)
+        else:
+            unknown.append(name)
+    if not toolsets:
+        toolsets = list(_DEFAULT_TOOLSETS)
+    return toolsets, unknown
