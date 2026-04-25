@@ -106,3 +106,53 @@ def translate_tools(cc_tools: Any) -> tuple[list[str], list[str]]:
     if not toolsets:
         toolsets = list(_DEFAULT_TOOLSETS)
     return toolsets, unknown
+
+
+def build_delegation_skill(
+    plugin: str,
+    agent_name: str,
+    cc_fm: dict[str, Any],
+    cc_body: str,
+) -> str:
+    """Translate a Claude Code agent file into a Hermes delegation skill.
+
+    Hermes does not have a native sub-agent primitive, so each Claude Code
+    agent becomes a "delegation skill" that, when matched, instructs Hermes
+    to invoke ``delegate_task`` with the agent's persona as context. The
+    returned string is a complete SKILL.md ready to be written to disk.
+    """
+    description = cc_fm.get("description", "").strip()
+    toolsets, unknown_tools = translate_tools(cc_fm.get("tools"))
+
+    new_fm = {
+        "name": f"{plugin}/agent/{agent_name}",
+        "description": description or f"Delegate to the {agent_name} sub-agent persona.",
+        "version": "1.0.0",
+        "metadata": {
+            "hermes": {
+                "source": plugin,
+                "source_kind": "agent",
+                "upstream_name": agent_name,
+                "toolsets": toolsets,
+            }
+        },
+    }
+
+    unknown_note = ""
+    if unknown_tools:
+        unknown_note = (
+            f"\n> ⚠️ Upstream tools not mapped to Hermes toolsets: {', '.join(unknown_tools)}\n"
+        )
+
+    body = (
+        "> 🤖 **Delegation skill** — translated from a Claude Code agent.\n"
+        "> When this skill matches, invoke `delegate_task` with:\n"
+        f"> - `toolsets`: {toolsets}\n"
+        "> - `context`: the persona text below, verbatim\n"
+        "> - `goal`: restate the user's ask from this persona's perspective\n"
+        "> - `max_iterations`: 30\n"
+        f"{unknown_note}\n"
+        "## Persona\n\n"
+        f"{cc_body.lstrip()}"
+    )
+    return render_frontmatter(new_fm, body)
