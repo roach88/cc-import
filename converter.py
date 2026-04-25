@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -266,7 +268,7 @@ def migrate_skill(
     manifest: dict[str, Any],
     plugin: str,
     skills_dir: Path,
-) -> None:
+) -> str:
     """Copy a Claude Code skill tree into the Hermes skills tree.
 
     The 3-hash decision matrix decides what to do on each call:
@@ -276,11 +278,14 @@ def migrate_skill(
 
     A skill dir without a ``SKILL.md`` is treated as not-a-skill and silently
     skipped — no manifest entry, no copy.
+
+    Returns one of ``"COPY"``, ``"UNCHANGED"``, ``"SKIP"``, or ``"NOSKILL"``
+    so callers (e.g. :func:`import_plugin`) can roll up summaries.
     """
     src_md = src_skill_dir / "SKILL.md"
     if not src_md.exists():
         logger.debug("No SKILL.md in %s — skipping", src_skill_dir)
-        return
+        return "NOSKILL"
 
     key = str(dest_skill_dir.relative_to(skills_dir))
     origin_hash = sha256_file(src_md)
@@ -291,7 +296,7 @@ def migrate_skill(
         local_hash = sha256_file(dest_md)
         if local_hash != entry["origin_hash"] and local_hash != origin_hash:
             logger.warning("SKIP (user-modified): %s", key)
-            return
+            return "SKIP"
         if local_hash == origin_hash:
             logger.debug("UNCHANGED: %s", key)
             manifest[key] = {
@@ -300,7 +305,7 @@ def migrate_skill(
                 "source_path": str(src_skill_dir),
                 "origin_hash": origin_hash,
             }
-            return
+            return "UNCHANGED"
 
     if dest_skill_dir.exists():
         shutil.rmtree(dest_skill_dir)
@@ -312,6 +317,7 @@ def migrate_skill(
         "origin_hash": origin_hash,
     }
     logger.info("COPY skill: %s", key)
+    return "COPY"
 
 
 def migrate_agent(
@@ -320,13 +326,15 @@ def migrate_agent(
     manifest: dict[str, Any],
     plugin: str,
     skills_dir: Path,
-) -> None:
+) -> str:
     """Translate a Claude Code agent ``.md`` into a Hermes delegation skill.
 
     Same 3-hash matrix as :func:`migrate_skill`, but ``origin_hash`` is
     computed over the *translated* output — so a change in
     :func:`build_delegation_skill`'s logic also triggers a re-translation
     on the next sync.
+
+    Returns one of ``"TRANSLATE"``, ``"UNCHANGED"``, or ``"SKIP"``.
     """
     content = src_agent_md.read_text()
     cc_fm, cc_body = parse_frontmatter(content)
@@ -343,7 +351,7 @@ def migrate_agent(
         local_hash = sha256_file(dest_md)
         if local_hash != entry["origin_hash"] and local_hash != origin_hash:
             logger.warning("SKIP (user-modified agent): %s", key)
-            return
+            return "SKIP"
         if local_hash == origin_hash:
             manifest[key] = {
                 "plugin": plugin,
@@ -351,7 +359,7 @@ def migrate_agent(
                 "source_path": str(src_agent_md),
                 "origin_hash": origin_hash,
             }
-            return
+            return "UNCHANGED"
 
     dest_skill_dir.mkdir(parents=True, exist_ok=True)
     dest_md.write_text(new_content)
@@ -362,6 +370,7 @@ def migrate_agent(
         "origin_hash": origin_hash,
     }
     logger.info("TRANSLATE agent: %s", key)
+    return "TRANSLATE"
 
 
 def prune_removed(
@@ -394,3 +403,126 @@ def prune_removed(
                 shutil.rmtree(dest_dir)
             logger.info("REMOVE (upstream deleted): %s", key)
         manifest.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — public entrypoint
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImportSummary:
+    """Result of a single :func:`import_plugin` call."""
+
+    plugin: str
+    skills_imported: int = 0
+    skills_unchanged: int = 0
+    agents_translated: int = 0
+    agents_unchanged: int = 0
+    skipped_user_modified: list[str] = field(default_factory=list)
+
+
+def _resolve_hermes_home(hermes_home: Path | None) -> Path:
+    if hermes_home is not None:
+        return hermes_home
+    env = os.environ.get("HERMES_HOME")
+    return Path(env) if env else Path.home() / ".hermes"
+
+
+def _repo_basename(git_url: str) -> str:
+    """Return the trailing path component of *git_url*, stripped of any ``.git``."""
+    base = git_url.rstrip("/").split("/")[-1]
+    if base.endswith(".git"):
+        base = base[:-4]
+    return base
+
+
+def _resolve_plugin_name(plugin_root: Path, fallback: str) -> str:
+    """Read ``plugin.json``'s ``name`` field, or fall back to *fallback*."""
+    plugin_json = plugin_root / "plugin.json"
+    if plugin_json.exists():
+        try:
+            data = json.loads(plugin_json.read_text())
+            name = data.get("name")
+            if isinstance(name, str) and name:
+                return name
+        except (json.JSONDecodeError, OSError):
+            pass
+    return fallback
+
+
+def import_plugin(
+    git_url: str,
+    *,
+    branch: str = "main",
+    subdir: str = "",
+    hermes_home: Path | None = None,
+) -> ImportSummary:
+    """Import a Claude Code plugin into a local Hermes install.
+
+    Clones (or fetches) *git_url*@*branch* into the plugin's clone cache,
+    then walks ``<repo>/<subdir>/skills/*`` and ``<repo>/<subdir>/agents/*.md``
+    invoking :func:`migrate_skill` and :func:`migrate_agent` for each. The
+    plugin name is read from ``plugin.json``'s ``name`` field if present,
+    otherwise derived from the git URL's trailing path component (sans
+    ``.git``). Manifest is persisted at
+    ``$HERMES_HOME/plugins/cc-import/state.json``.
+
+    *hermes_home* defaults to the ``HERMES_HOME`` env var or ``~/.hermes``.
+    """
+    home = _resolve_hermes_home(hermes_home)
+    skills_dir = home / "skills"
+    state_dir = home / "plugins" / "cc-import"
+    clone_root = state_dir / "clones"
+    manifest_path = state_dir / "state.json"
+
+    repo_basename = _repo_basename(git_url)
+    clone_dest = clone_root / repo_basename
+
+    clone_or_update(git_url, branch, clone_dest)
+
+    plugin_root = clone_dest / subdir if subdir else clone_dest
+    plugin_name = _resolve_plugin_name(plugin_root, repo_basename)
+
+    manifest = load_manifest(manifest_path)
+    summary = ImportSummary(plugin=plugin_name)
+    seen_keys: set[str] = set()
+
+    skills_src = plugin_root / "skills"
+    if skills_src.is_dir():
+        plugin_dest = skills_dir / plugin_name
+        plugin_dest.mkdir(parents=True, exist_ok=True)
+        for skill_dir in sorted(skills_src.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            dest = plugin_dest / skill_dir.name
+            status = migrate_skill(skill_dir, dest, manifest, plugin_name, skills_dir)
+            key = str(dest.relative_to(skills_dir))
+            seen_keys.add(key)
+            if status == "COPY":
+                summary.skills_imported += 1
+            elif status == "UNCHANGED":
+                summary.skills_unchanged += 1
+            elif status == "SKIP":
+                summary.skipped_user_modified.append(key)
+
+    agents_src = plugin_root / "agents"
+    if agents_src.is_dir():
+        agents_dest_root = skills_dir / plugin_name / "agents"
+        agents_dest_root.mkdir(parents=True, exist_ok=True)
+        for agent_md in sorted(agents_src.rglob("*.md")):
+            agent_name = agent_md.stem
+            dest = agents_dest_root / agent_name
+            status = migrate_agent(agent_md, dest, manifest, plugin_name, skills_dir)
+            key = str(dest.relative_to(skills_dir))
+            seen_keys.add(key)
+            if status == "TRANSLATE":
+                summary.agents_translated += 1
+            elif status == "UNCHANGED":
+                summary.agents_unchanged += 1
+            elif status == "SKIP":
+                summary.skipped_user_modified.append(key)
+
+    prune_removed(plugin_name, seen_keys, manifest, skills_dir)
+    save_manifest(manifest_path, manifest)
+    return summary

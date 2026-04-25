@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,16 @@ import pytest
 
 def _load_converter():
     repo_root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("cc_import_converter", repo_root / "converter.py")
+    name = "cc_import_converter"
+    spec = importlib.util.spec_from_file_location(name, repo_root / "converter.py")
     assert spec is not None
     assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so @dataclass can introspect cls.__module__ via
+    # sys.modules during forward-ref resolution. (`from __future__ import
+    # annotations` makes all annotations strings; dataclasses resolves them
+    # by looking up the module in sys.modules.)
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
