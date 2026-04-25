@@ -13,6 +13,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _load_converter():
     repo_root = Path(__file__).resolve().parents[1]
@@ -77,3 +79,44 @@ class TestParseFrontmatter:
         text = "---\ntools:\n  - Read\n  - Bash\n---\nbody"
         fm, _ = _CONVERTER.parse_frontmatter(text)
         assert fm == {"tools": ["Read", "Bash"]}
+
+
+class TestRenderFrontmatter:
+    """``render_frontmatter(fm, body) -> str`` — produces a parseable document."""
+
+    @pytest.mark.parametrize(
+        "fm,body",
+        [
+            ({"name": "foo"}, "body text"),
+            ({"name": "foo", "tools": ["Read", "Bash"]}, "multi\nline\nbody"),
+            ({"deeply": {"nested": "value"}}, "x"),
+            ({"name": "foo"}, "body with trailing newline\n"),
+        ],
+    )
+    def test_round_trip_through_parse_frontmatter(self, fm, body):
+        rendered = _CONVERTER.render_frontmatter(fm, body)
+        parsed_fm, parsed_body = _CONVERTER.parse_frontmatter(rendered)
+        assert parsed_fm == fm
+        assert parsed_body == body
+
+    def test_empty_fm_round_trips(self):
+        rendered = _CONVERTER.render_frontmatter({}, "body")
+        parsed_fm, parsed_body = _CONVERTER.parse_frontmatter(rendered)
+        assert parsed_fm == {}
+        assert parsed_body == "body"
+
+    def test_body_leading_whitespace_is_stripped(self):
+        # Documented lossy behavior: body.lstrip() removes leading whitespace
+        # before insertion, so a body with leading newlines does not round-trip.
+        rendered = _CONVERTER.render_frontmatter({"name": "foo"}, "\n\nactual body")
+        _, parsed_body = _CONVERTER.parse_frontmatter(rendered)
+        assert parsed_body == "actual body"
+
+    def test_output_starts_with_opening_fence(self):
+        rendered = _CONVERTER.render_frontmatter({"name": "foo"}, "body")
+        assert rendered.startswith("---\n")
+
+    def test_output_separates_fence_from_body_with_blank_line(self):
+        rendered = _CONVERTER.render_frontmatter({"name": "foo"}, "body")
+        # Closing fence + double newline before body
+        assert "---\n\nbody" in rendered
