@@ -16,9 +16,7 @@ from pathlib import Path
 
 def _load_converter():
     repo_root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location(
-        "cc_import_converter", repo_root / "converter.py"
-    )
+    spec = importlib.util.spec_from_file_location("cc_import_converter", repo_root / "converter.py")
     assert spec is not None
     assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -45,7 +43,10 @@ class TestParseFrontmatter:
         assert body == text
 
     def test_empty_frontmatter_block_returns_empty_dict(self):
-        text = "---\n---\nbody"
+        # An empty FM block needs at least a blank line between the fences for
+        # the regex to find a closing fence — `---\n---\nbody` is treated as no
+        # frontmatter at all (returns the whole input as body).
+        text = "---\n\n---\nbody"
         fm, body = _CONVERTER.parse_frontmatter(text)
         assert fm == {}
         assert body == "body"
