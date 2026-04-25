@@ -11,7 +11,10 @@ repo means the test suite continues to work after the eventual upstream
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def _load_converter():
@@ -317,3 +320,163 @@ class TestBuildDelegationSkill:
         # cc_body.lstrip() inside the function removes the leading newlines
         # before they hit the "## Persona\n\n<body>" boundary
         assert "## Persona\n\nactual persona content" in body
+
+
+class TestSha256Helpers:
+    """``sha256_bytes(data) -> hex``, ``sha256_file(path) -> hex``."""
+
+    def test_sha256_bytes_empty_input(self):
+        assert (
+            _CONVERTER.sha256_bytes(b"")
+            == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+
+    def test_sha256_bytes_known_input(self):
+        # Hand-verified reference value
+        assert (
+            _CONVERTER.sha256_bytes(b"hello")
+            == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        )
+
+    def test_sha256_file_matches_sha256_bytes(self, tmp_path):
+        p = tmp_path / "f.txt"
+        p.write_bytes(b"hello\nworld\n")
+        assert _CONVERTER.sha256_file(p) == _CONVERTER.sha256_bytes(b"hello\nworld\n")
+
+    def test_sha256_file_reads_bytes_so_line_endings_matter(self, tmp_path):
+        # Reading via bytes preserves CRLF / LF differences — important because
+        # the manifest's user-modified detection compares hashes of files that
+        # may have been touched by editors that normalize line endings.
+        p_lf = tmp_path / "lf.txt"
+        p_crlf = tmp_path / "crlf.txt"
+        p_lf.write_bytes(b"a\nb\n")
+        p_crlf.write_bytes(b"a\r\nb\r\n")
+        assert _CONVERTER.sha256_file(p_lf) != _CONVERTER.sha256_file(p_crlf)
+
+
+class TestManifestIO:
+    """``load_manifest(path)``, ``save_manifest(path, manifest)``."""
+
+    def test_load_returns_empty_when_path_does_not_exist(self, tmp_path):
+        result = _CONVERTER.load_manifest(tmp_path / "nonexistent.json")
+        assert result == {}
+
+    def test_save_then_load_round_trip(self, tmp_path):
+        path = tmp_path / "state.json"
+        data = {"foo/skill1": {"plugin": "foo", "origin_hash": "abc123", "kind": "skill"}}
+        _CONVERTER.save_manifest(path, data)
+        loaded = _CONVERTER.load_manifest(path)
+        assert loaded == data
+
+    def test_save_creates_parent_directories(self, tmp_path):
+        path = tmp_path / "deep" / "nested" / "state.json"
+        _CONVERTER.save_manifest(path, {"x": {"plugin": "y"}})
+        assert path.exists()
+        assert path.parent.is_dir()
+
+    def test_save_emits_diff_friendly_json(self, tmp_path):
+        # indent=2 + sort_keys=True so successive saves produce stable diffs.
+        path = tmp_path / "state.json"
+        _CONVERTER.save_manifest(path, {"zzz": 1, "aaa": 2})
+        text = path.read_text()
+        # Keys sorted alphabetically (aaa appears before zzz)
+        assert text.index('"aaa"') < text.index('"zzz"')
+        # Multi-line indented output
+        assert "\n" in text
+        assert "  " in text  # 2-space indent
+
+    def test_load_corrupt_json_returns_empty_with_warning(self, tmp_path, caplog):
+        import logging
+
+        path = tmp_path / "state.json"
+        path.write_text("this is not { valid json")
+        with caplog.at_level(logging.WARNING):
+            result = _CONVERTER.load_manifest(path)
+        assert result == {}
+        assert any("corrupt" in rec.message.lower() for rec in caplog.records)
+
+
+@pytest.fixture
+def bare_upstream(tmp_path):
+    """Create a bare git repo on ``main`` with one initial commit. Yields the path.
+
+    Uses real ``git`` subprocess calls (no mocks) so :func:`clone_or_update`
+    exercises the actual clone/fetch/reset paths against a real ``file://``
+    upstream. The bare repo and its scratch worktree both live under
+    ``tmp_path`` so cleanup is automatic.
+    """
+    bare = tmp_path / "upstream.git"
+    work = tmp_path / "upstream-work"
+
+    def _git(*args: str, cwd: Path | None = None) -> None:
+        cmd = ["git"]
+        if cwd is not None:
+            cmd.extend(["-C", str(cwd)])
+        cmd.extend(args)
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    _git("init", "--bare", "-b", "main", str(bare))
+    _git("init", "-b", "main", str(work))
+    (work / "README.md").write_text("initial\n")
+    _git("config", "user.email", "test@example.com", cwd=work)
+    _git("config", "user.name", "Test", cwd=work)
+    _git("add", "README.md", cwd=work)
+    _git("commit", "-m", "initial", cwd=work)
+    _git("remote", "add", "origin", f"file://{bare}", cwd=work)
+    _git("push", "origin", "main", cwd=work)
+    return bare
+
+
+def _git_in(work: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True)
+
+
+def _add_upstream_commit(bare: Path, tmp_path: Path, filename: str, content: str) -> None:
+    """Clone the bare upstream into a scratch worktree, add a file, push back."""
+    work = tmp_path / f"scratch-{filename}"
+    subprocess.run(["git", "clone", f"file://{bare}", str(work)], check=True, capture_output=True)
+    (work / filename).write_text(content)
+    _git_in(work, "config", "user.email", "test@example.com")
+    _git_in(work, "config", "user.name", "Test")
+    _git_in(work, "add", filename)
+    _git_in(work, "commit", "-m", f"add {filename}")
+    _git_in(work, "push", "origin", "main")
+
+
+class TestCloneOrUpdate:
+    """``clone_or_update(url, branch, dest)`` — wraps git clone/fetch/reset."""
+
+    def test_clones_to_fresh_destination(self, tmp_path, bare_upstream):
+        dest = tmp_path / "dest"
+        _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+        assert dest.is_dir()
+        assert (dest / ".git").is_dir()
+        assert (dest / "README.md").exists()
+
+    def test_picks_up_upstream_changes_on_rerun(self, tmp_path, bare_upstream):
+        dest = tmp_path / "dest"
+        url = f"file://{bare_upstream}"
+        _CONVERTER.clone_or_update(url, "main", dest)
+        assert not (dest / "added.md").exists()
+
+        _add_upstream_commit(bare_upstream, tmp_path, "added.md", "added content")
+        _CONVERTER.clone_or_update(url, "main", dest)
+
+        assert (dest / "added.md").exists()
+        assert (dest / "added.md").read_text() == "added content"
+
+    def test_replaces_non_git_directory_with_clone(self, tmp_path, bare_upstream):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "stray.txt").write_text("garbage left from somewhere else")
+
+        _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+
+        assert not (dest / "stray.txt").exists()
+        assert (dest / ".git").is_dir()
+        assert (dest / "README.md").exists()
+
+    def test_invalid_branch_raises_called_process_error(self, tmp_path, bare_upstream):
+        dest = tmp_path / "dest"
+        with pytest.raises(subprocess.CalledProcessError):
+            _CONVERTER.clone_or_update(f"file://{bare_upstream}", "nonexistent-branch", dest)
