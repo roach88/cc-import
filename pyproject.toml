@@ -58,6 +58,17 @@ indent-style = "space"
 [tool.ty.environment]
 python-version = "3.11"
 
+# Ignore unresolved-import diagnostics for the plugin's own files: ty cannot
+# statically resolve the ``from . import cli`` form because the repo is not
+# itself a package (Hermes loads __init__.py with an injected package
+# context at runtime). Matches Hermes's own pyproject.toml convention for
+# the same reason.
+[[tool.ty.overrides]]
+include = ["**"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # import-mode=importlib bypasses pytest's __init__.py-based package detection.

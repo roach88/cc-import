@@ -11,9 +11,11 @@ import argparse
 import subprocess
 import sys
 
-# Absolute import — see the docstring on __init__.py for why we don't use
-# ``from . import converter`` here.
-import converter
+# Try-relative-then-absolute import — see ``__init__.py`` for the rationale.
+try:
+    from . import converter
+except ImportError:
+    import converter  # type: ignore[no-redef]
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> None:

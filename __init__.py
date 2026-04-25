@@ -9,12 +9,16 @@ configured sources.
 
 from __future__ import annotations
 
-# Absolute imports rather than ``from . import cli``: at the repo-root layout
-# Hermes uses for plugins, the plugin's directory is added to sys.path by
-# the loader, and absolute imports work in both that context and pytest's
-# default rootdir handling. Relative imports would require pytest to treat
-# the repo root as a package, which conflicts with rootdir + pyproject.toml.
-import cli
+# Hermes loads this plugin as a namespace-package member (sets
+# ``module.__package__`` and ``module.__path__`` before exec), so the
+# relative import succeeds in production. Pytest, by contrast, imports
+# ``__init__.py`` at the repo root without any package context, so the
+# relative form raises ImportError; the absolute fallback then finds
+# ``cli.py`` via the repo root on ``sys.path``.
+try:
+    from . import cli
+except ImportError:
+    import cli  # type: ignore[no-redef]
 
 
 def register(ctx) -> None:
