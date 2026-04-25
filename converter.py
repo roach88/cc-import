@@ -253,3 +253,144 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
         ["git", "clone", "--depth=1", "--branch", branch, url, str(dest)],
         check=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Migration core — skill copy, agent translation, prune cleanup
+# ---------------------------------------------------------------------------
+
+
+def migrate_skill(
+    src_skill_dir: Path,
+    dest_skill_dir: Path,
+    manifest: dict[str, Any],
+    plugin: str,
+    skills_dir: Path,
+) -> None:
+    """Copy a Claude Code skill tree into the Hermes skills tree.
+
+    The 3-hash decision matrix decides what to do on each call:
+      - ``local == origin``           → UNCHANGED (refresh manifest, no rewrite)
+      - ``local == prior_origin``     → COPY    (upstream updated, user clean)
+      - ``local`` differs from both   → SKIP    (user-modified, preserved with warning)
+
+    A skill dir without a ``SKILL.md`` is treated as not-a-skill and silently
+    skipped — no manifest entry, no copy.
+    """
+    src_md = src_skill_dir / "SKILL.md"
+    if not src_md.exists():
+        logger.debug("No SKILL.md in %s — skipping", src_skill_dir)
+        return
+
+    key = str(dest_skill_dir.relative_to(skills_dir))
+    origin_hash = sha256_file(src_md)
+    entry = manifest.get(key)
+    dest_md = dest_skill_dir / "SKILL.md"
+
+    if dest_md.exists() and entry:
+        local_hash = sha256_file(dest_md)
+        if local_hash != entry["origin_hash"] and local_hash != origin_hash:
+            logger.warning("SKIP (user-modified): %s", key)
+            return
+        if local_hash == origin_hash:
+            logger.debug("UNCHANGED: %s", key)
+            manifest[key] = {
+                "plugin": plugin,
+                "kind": "skill",
+                "source_path": str(src_skill_dir),
+                "origin_hash": origin_hash,
+            }
+            return
+
+    if dest_skill_dir.exists():
+        shutil.rmtree(dest_skill_dir)
+    shutil.copytree(src_skill_dir, dest_skill_dir)
+    manifest[key] = {
+        "plugin": plugin,
+        "kind": "skill",
+        "source_path": str(src_skill_dir),
+        "origin_hash": origin_hash,
+    }
+    logger.info("COPY skill: %s", key)
+
+
+def migrate_agent(
+    src_agent_md: Path,
+    dest_skill_dir: Path,
+    manifest: dict[str, Any],
+    plugin: str,
+    skills_dir: Path,
+) -> None:
+    """Translate a Claude Code agent ``.md`` into a Hermes delegation skill.
+
+    Same 3-hash matrix as :func:`migrate_skill`, but ``origin_hash`` is
+    computed over the *translated* output — so a change in
+    :func:`build_delegation_skill`'s logic also triggers a re-translation
+    on the next sync.
+    """
+    content = src_agent_md.read_text()
+    cc_fm, cc_body = parse_frontmatter(content)
+    agent_name = cc_fm.get("name") or src_agent_md.stem
+
+    new_content = build_delegation_skill(plugin, agent_name, cc_fm, cc_body)
+
+    key = str(dest_skill_dir.relative_to(skills_dir))
+    origin_hash = sha256_bytes(new_content.encode())
+    entry = manifest.get(key)
+    dest_md = dest_skill_dir / "SKILL.md"
+
+    if dest_md.exists() and entry:
+        local_hash = sha256_file(dest_md)
+        if local_hash != entry["origin_hash"] and local_hash != origin_hash:
+            logger.warning("SKIP (user-modified agent): %s", key)
+            return
+        if local_hash == origin_hash:
+            manifest[key] = {
+                "plugin": plugin,
+                "kind": "agent",
+                "source_path": str(src_agent_md),
+                "origin_hash": origin_hash,
+            }
+            return
+
+    dest_skill_dir.mkdir(parents=True, exist_ok=True)
+    dest_md.write_text(new_content)
+    manifest[key] = {
+        "plugin": plugin,
+        "kind": "agent",
+        "source_path": str(src_agent_md),
+        "origin_hash": origin_hash,
+    }
+    logger.info("TRANSLATE agent: %s", key)
+
+
+def prune_removed(
+    plugin: str,
+    seen_keys: set[str],
+    manifest: dict[str, Any],
+    skills_dir: Path,
+) -> None:
+    """Remove dest dirs for skills no longer in upstream, if unmodified.
+
+    Iterates manifest entries scoped to ``plugin`` that were *not* observed
+    during this sync (i.e., not in ``seen_keys``). For each such stale
+    entry: if the on-disk file is unmodified relative to the recorded
+    ``origin_hash``, delete it and pop the manifest entry; otherwise log a
+    KEEP warning and retain both file and manifest entry. If the file has
+    already been deleted out from under us, the manifest entry is popped
+    cleanly.
+    """
+    stale = [k for k, v in manifest.items() if v.get("plugin") == plugin and k not in seen_keys]
+    for key in stale:
+        entry = manifest[key]
+        dest_md = skills_dir / key / "SKILL.md"
+        if dest_md.exists():
+            local_hash = sha256_file(dest_md)
+            if local_hash != entry["origin_hash"]:
+                logger.warning("KEEP (user-modified, upstream removed): %s", key)
+                continue
+            dest_dir = skills_dir / key
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            logger.info("REMOVE (upstream deleted): %s", key)
+        manifest.pop(key, None)
