@@ -1,0 +1,4 @@
+name: cc-import
+version: 0.1.0
+description: "Import Claude Code plugins (skills + agents) into Hermes Agent. Translates Claude Code agent personas into Hermes delegation skills, copies skill bundles into the user's skills/ tree."
+author: Tyler Barstow

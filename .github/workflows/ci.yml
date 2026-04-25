@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dev dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install "pyyaml>=6.0,<7" "pytest>=8.0,<9" "pytest-mock>=3.12,<4" "ruff>=0.6,<1" "ty>=0.0.1a13"
+
+      - name: ruff check
+        run: |
+          source .venv/bin/activate
+          ruff check .
+
+      - name: ruff format --check
+        run: |
+          source .venv/bin/activate
+          ruff format --check .
+
+      - name: ty check
+        run: |
+          source .venv/bin/activate
+          ty check .
+
+      - name: pytest
+        run: |
+          source .venv/bin/activate
+          pytest
