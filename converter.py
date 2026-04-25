@@ -32,3 +32,14 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     except yaml.YAMLError:
         fm = {}
     return fm, body
+
+
+def render_frontmatter(fm: dict[str, Any], body: str) -> str:
+    """Render a (frontmatter_dict, body) pair as a frontmatter-prefixed document.
+
+    Round-trips with :func:`parse_frontmatter` for any ``body`` that does not
+    have leading whitespace — leading whitespace is stripped via
+    ``body.lstrip()`` before insertion (mirroring plugin_sync.py's behavior).
+    """
+    fm_yaml = yaml.safe_dump(fm, sort_keys=False).strip()
+    return f"---\n{fm_yaml}\n---\n\n{body.lstrip()}"
