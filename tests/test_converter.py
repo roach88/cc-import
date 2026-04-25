@@ -214,3 +214,106 @@ class TestTranslateTools:
         toolsets, unknown = _CONVERTER.translate_tools("  Read  ,  Bash  ")
         assert toolsets == ["file", "terminal"]
         assert unknown == []
+
+
+class TestBuildDelegationSkill:
+    """``build_delegation_skill(plugin, agent_name, cc_fm, cc_body) -> str``.
+
+    Translates a Claude Code agent markdown file into a Hermes "delegation
+    skill" SKILL.md — frontmatter is rewritten to identify the skill as a
+    delegation, body wraps the original CC persona under a ``## Persona``
+    section preceded by instructions on how Hermes should invoke
+    ``delegate_task``.
+    """
+
+    def test_happy_path_full_translation(self):
+        cc_fm = {
+            "name": "secsentinel",
+            "description": "Audit security posture",
+            "tools": "Read,Bash",
+        }
+        cc_body = "You are a security reviewer.\nYour job is to find vulns."
+        result = _CONVERTER.build_delegation_skill(
+            "compound-engineering", "secsentinel", cc_fm, cc_body
+        )
+        fm, body = _CONVERTER.parse_frontmatter(result)
+        assert fm["name"] == "compound-engineering/agent/secsentinel"
+        assert fm["description"] == "Audit security posture"
+        assert fm["version"] == "1.0.0"
+        hermes_meta = fm["metadata"]["hermes"]
+        assert hermes_meta["source"] == "compound-engineering"
+        assert hermes_meta["source_kind"] == "agent"
+        assert hermes_meta["upstream_name"] == "secsentinel"
+        assert hermes_meta["toolsets"] == ["file", "terminal"]
+        # Body contents
+        assert "Delegation skill" in body
+        assert "## Persona" in body
+        assert "You are a security reviewer." in body
+        assert "Your job is to find vulns." in body
+
+    def test_missing_description_uses_fallback(self):
+        cc_fm = {"name": "x", "tools": "Read"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "persona body")
+        fm, _ = _CONVERTER.parse_frontmatter(result)
+        assert fm["description"] == "Delegate to the x sub-agent persona."
+
+    def test_empty_description_uses_fallback(self):
+        cc_fm = {"name": "x", "description": "   ", "tools": "Read"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "persona body")
+        fm, _ = _CONVERTER.parse_frontmatter(result)
+        assert fm["description"] == "Delegate to the x sub-agent persona."
+
+    def test_unknown_tools_emit_warning_note_in_body(self):
+        cc_fm = {"description": "X", "tools": ["Read", "MagicTool", "Mystery"]}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "p")
+        _, body = _CONVERTER.parse_frontmatter(result)
+        assert "Upstream tools not mapped" in body
+        assert "MagicTool" in body
+        assert "Mystery" in body
+
+    def test_no_unknown_tools_no_warning_note(self):
+        cc_fm = {"description": "X", "tools": ["Read", "Bash"]}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "p")
+        _, body = _CONVERTER.parse_frontmatter(result)
+        assert "Upstream tools not mapped" not in body
+
+    def test_empty_cc_body_still_produces_well_formed_output(self):
+        cc_fm = {"description": "X", "tools": "Read"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "")
+        fm, body = _CONVERTER.parse_frontmatter(result)
+        assert fm["name"] == "plug/agent/x"
+        assert "## Persona" in body
+
+    def test_no_tools_in_cc_fm_uses_default_toolsets(self):
+        cc_fm = {"description": "X"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "p")
+        fm, _ = _CONVERTER.parse_frontmatter(result)
+        assert fm["metadata"]["hermes"]["toolsets"] == ["file", "web"]
+
+    def test_toolsets_appear_in_body_for_delegate_task_invocation(self):
+        cc_fm = {"description": "X", "tools": "Read,Bash,WebSearch"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "p")
+        fm, body = _CONVERTER.parse_frontmatter(result)
+        toolsets = fm["metadata"]["hermes"]["toolsets"]
+        assert toolsets == ["file", "terminal", "web"]
+        # The body's `toolsets:` invocation line shows the Python list repr
+        assert str(toolsets) in body
+
+    def test_body_documents_delegate_task_invocation_shape(self):
+        cc_fm = {"description": "X", "tools": "Read"}
+        result = _CONVERTER.build_delegation_skill("plug", "x", cc_fm, "p")
+        _, body = _CONVERTER.parse_frontmatter(result)
+        assert "delegate_task" in body
+        assert "context" in body
+        assert "goal" in body
+        assert "max_iterations" in body
+
+    def test_cc_body_leading_whitespace_stripped_before_persona_section(self):
+        cc_fm = {"description": "X", "tools": "Read"}
+        result = _CONVERTER.build_delegation_skill(
+            "plug", "x", cc_fm, "\n\n\nactual persona content"
+        )
+        _, body = _CONVERTER.parse_frontmatter(result)
+        # cc_body.lstrip() inside the function removes the leading newlines
+        # before they hit the "## Persona\n\n<body>" boundary
+        assert "## Persona\n\nactual persona content" in body
