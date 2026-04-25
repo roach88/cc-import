@@ -1,19 +1,16 @@
-"""Tests for ``cli.py`` — the ``hermes cc-import install`` subcommand.
+"""Tests for ``cli.py`` — the ``/cc-import`` slash-command handler.
 
-``setup_parser`` adds the ``install`` subparser (one positional + two
-options). ``cmd_install`` dispatches to :func:`converter.import_plugin` and
-prints a one-line summary.
+Slash commands have signature ``fn(raw_args: str) -> str | None``. Our
+handler dispatches to subcommands (``install`` in slice 1) and returns a
+result string suitable for display in CLI / chat / gateway sessions.
 """
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 
 def _load_plugin_init():
@@ -34,117 +31,85 @@ _CLI = _PLUGIN.cli
 _CONVERTER = _CLI.converter
 
 
-class TestSetupParser:
-    """``setup_parser(parser)`` — wires the ``install`` subcommand."""
+class TestHandleCommand:
+    """``handle_command(raw_args) -> str`` — slash-command dispatcher."""
 
-    def _fresh_parser(self):
-        parser = argparse.ArgumentParser(prog="hermes cc-import")
-        _CLI.setup_parser(parser)
-        return parser
-
-    def test_install_required_url_with_defaults(self):
-        parser = self._fresh_parser()
-        args = parser.parse_args(["install", "https://example.com/foo.git"])
-        assert args.git_url == "https://example.com/foo.git"
-        assert args.branch == "main"
-        assert args.subdir == ""
-
-    def test_install_with_explicit_branch_and_subdir(self):
-        parser = self._fresh_parser()
-        args = parser.parse_args(["install", "URL", "--branch", "dev", "--subdir", "plugins/foo"])
-        assert args.branch == "dev"
-        assert args.subdir == "plugins/foo"
-
-    def test_install_dispatches_to_cmd_install(self):
-        parser = self._fresh_parser()
-        args = parser.parse_args(["install", "URL"])
-        assert args.func is _CLI.cmd_install
-
-    def test_missing_positional_url_exits(self):
-        parser = self._fresh_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["install"])
-
-    def test_no_subcommand_exits(self):
-        parser = self._fresh_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args([])
-
-
-def _make_args(git_url: str = "URL", branch: str = "main", subdir: str = ""):
-    return argparse.Namespace(git_url=git_url, branch=branch, subdir=subdir)
-
-
-class TestCmdInstall:
-    """``cmd_install(args)`` — calls converter.import_plugin, prints summary."""
-
-    def test_happy_path_calls_import_plugin_with_parsed_args(self, monkeypatch, capsys):
+    def test_install_happy_path_calls_import_plugin(self, monkeypatch):
         captured: dict = {}
 
         def fake_import(git_url, **kwargs):
             captured["git_url"] = git_url
             captured["kwargs"] = kwargs
-            return _CONVERTER.ImportSummary(
-                plugin="myplug",
-                skills_imported=2,
-                agents_translated=1,
-            )
+            return _CONVERTER.ImportSummary(plugin="myplug", skills_imported=2, agents_translated=1)
 
         monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
-        rc = _CLI.cmd_install(_make_args("https://example.com/foo.git", "dev", "plugins/foo"))
-        assert rc == 0
+        result = _CLI.handle_command("install https://example.com/foo.git")
         assert captured["git_url"] == "https://example.com/foo.git"
+        assert captured["kwargs"] == {"branch": "main", "subdir": ""}
+        assert "myplug" in result
+        assert "2" in result and "1" in result
+
+    def test_install_parses_branch_and_subdir_options(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_import(git_url, **kwargs):
+            captured["kwargs"] = kwargs
+            return _CONVERTER.ImportSummary(plugin="x")
+
+        monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
+        _CLI.handle_command("install URL --branch dev --subdir plugins/foo")
         assert captured["kwargs"] == {"branch": "dev", "subdir": "plugins/foo"}
 
-    def test_happy_path_prints_summary_with_plugin_name_and_counts(self, monkeypatch, capsys):
-        def fake_import(git_url, **kwargs):
-            return _CONVERTER.ImportSummary(
-                plugin="myplug",
-                skills_imported=3,
-                agents_translated=2,
-            )
+    def test_empty_args_returns_usage(self):
+        result = _CLI.handle_command("")
+        assert "install" in result.lower() or "usage" in result.lower()
 
-        monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
-        _CLI.cmd_install(_make_args())
-        out = capsys.readouterr().out
-        assert "myplug" in out
-        assert "3" in out
-        assert "2" in out
+    def test_unknown_subcommand_returns_helpful_error(self):
+        result = _CLI.handle_command("frobulate URL")
+        assert "frobulate" in result or "unknown" in result.lower() or "install" in result
 
-    def test_clone_failure_returns_nonzero_with_friendly_message(self, monkeypatch, capsys):
+    def test_install_without_url_returns_error(self):
+        result = _CLI.handle_command("install")
+        # argparse error or usage mention
+        assert "git_url" in result.lower() or "url" in result.lower() or "error" in result.lower()
+
+    def test_clone_failure_returns_error_string_with_url(self, monkeypatch):
         def fake_import(git_url, **kwargs):
             raise subprocess.CalledProcessError(returncode=128, cmd=["git", "clone"])
 
         monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
-        rc = _CLI.cmd_install(_make_args("BAD-URL"))
-        assert rc != 0
-        captured = capsys.readouterr()
-        # Friendly error mentions the URL and the failure
-        combined = captured.out + captured.err
-        assert "BAD-URL" in combined
+        result = _CLI.handle_command("install BAD-URL")
+        assert "BAD-URL" in result
 
-    def test_unexpected_exception_caught_and_reported(self, monkeypatch, capsys):
+    def test_unexpected_exception_caught_and_reported(self, monkeypatch):
         def fake_import(git_url, **kwargs):
             raise RuntimeError("something exploded")
 
         monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
-        rc = _CLI.cmd_install(_make_args("URL"))
-        assert rc != 0
-        captured = capsys.readouterr()
-        combined = captured.out + captured.err
-        assert "exploded" in combined or "Error" in combined or "error" in combined
+        result = _CLI.handle_command("install URL")
+        assert "exploded" in result or "error" in result.lower()
 
-    def test_skipped_user_modified_surfaced_in_output(self, monkeypatch, capsys):
+    def test_skipped_user_modified_surfaced(self, monkeypatch):
         def fake_import(git_url, **kwargs):
             return _CONVERTER.ImportSummary(
                 plugin="myplug",
                 skills_imported=1,
-                agents_translated=0,
                 skipped_user_modified=["myplug/agents/foo", "myplug/bar"],
             )
 
         monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
-        _CLI.cmd_install(_make_args())
-        out = capsys.readouterr().out
-        # User-modified skips should be visible to the operator
-        assert "myplug/agents/foo" in out or "user-modified" in out.lower()
+        result = _CLI.handle_command("install URL")
+        assert "myplug/agents/foo" in result or "user-modified" in result.lower()
+
+    def test_unchanged_counts_surfaced_when_present(self, monkeypatch):
+        def fake_import(git_url, **kwargs):
+            return _CONVERTER.ImportSummary(
+                plugin="myplug",
+                skills_imported=0,
+                skills_unchanged=5,
+                agents_unchanged=3,
+            )
+
+        monkeypatch.setattr(_CONVERTER, "import_plugin", fake_import)
+        result = _CLI.handle_command("install URL")
+        assert "5" in result and "3" in result

@@ -1,10 +1,16 @@
 """cc-import — Hermes plugin entry point.
 
-Slice 1 wires only the ``hermes cc-import`` CLI subcommand. Slice 2 will
-add agent-callable tools (``cc_import_install``, ``cc_import_list``,
+Slice 1 wires only the ``/cc-import`` slash command. Slice 2 will add
+agent-callable tools (``cc_import_install``, ``cc_import_list``,
 ``cc_import_remove``) via :meth:`PluginContext.register_tool`. Slice 3
 will add an ``on_session_start`` hook that opportunistically re-syncs
 configured sources.
+
+Why a slash command instead of a top-level CLI subcommand: Hermes's
+``register_cli_command`` stores registrations but does not yet wire them
+into ``hermes <plugin>`` argparse — only memory-plugin CLI registrations
+are consumed. ``register_command`` (slash commands) IS consumed and
+works in interactive sessions and gateway adapters.
 """
 
 from __future__ import annotations
@@ -22,14 +28,13 @@ except ImportError:
 
 
 def register(ctx) -> None:
-    """Register cc-import's CLI subcommand with the Hermes plugin loader."""
-    ctx.register_cli_command(
+    """Register cc-import's slash command with the Hermes plugin loader."""
+    ctx.register_command(
         name="cc-import",
-        help="Import Claude Code plugins (skills + agents) into Hermes.",
-        setup_fn=cli.setup_parser,
+        handler=cli.handle_command,
         description=(
-            "Manage Claude Code plugin imports. Translates Claude Code agent "
-            "personas into Hermes delegation skills and copies skill bundles "
-            "into the user's skills tree."
+            "Import Claude Code plugins (skills + agents) into Hermes. "
+            "Subcommand: install <git-url> [--branch BRANCH] [--subdir SUBDIR]."
         ),
+        args_hint="install <git-url>",
     )

@@ -1,15 +1,15 @@
-"""``hermes cc-import`` CLI subcommand handlers.
+"""``/cc-import`` slash-command handler.
 
-Slice 1 ships only ``install``. The ``list``, ``remove``, ``update``,
-``sync``, and ``sources`` subcommands land in slice 3 alongside
+Slice 1 ships only the ``install`` subcommand. ``list``, ``remove``,
+``update``, ``sync``, and ``sources`` land in slice 3 alongside
 ``sources.yaml`` and the auto-sync hook.
 """
 
 from __future__ import annotations
 
 import argparse
+import shlex
 import subprocess
-import sys
 
 # Try-relative-then-absolute import — see ``__init__.py`` for the rationale.
 try:
@@ -17,71 +17,65 @@ try:
 except ImportError:
     import converter  # type: ignore[no-redef]
 
-
-def setup_parser(parser: argparse.ArgumentParser) -> None:
-    """Wire the ``install`` subcommand onto the ``hermes cc-import`` parser."""
-    sub = parser.add_subparsers(dest="cc_import_subcommand", required=True)
-
-    install_p = sub.add_parser(
-        "install",
-        help="Import a Claude Code plugin (skills + agents) from a git URL.",
-        description=(
-            "Clone the plugin repo, copy its skills into "
-            "$HERMES_HOME/skills/<plugin>/, and translate each Claude Code "
-            "agent into a Hermes delegation skill."
-        ),
-    )
-    install_p.add_argument(
-        "git_url",
-        help="Git URL of the Claude Code plugin repo (HTTPS, SSH, or file://).",
-    )
-    install_p.add_argument(
-        "--branch",
-        default="main",
-        help="Branch to clone (default: main).",
-    )
-    install_p.add_argument(
-        "--subdir",
-        default="",
-        help=(
-            "Subdirectory within the repo where the plugin lives "
-            "(e.g. 'plugins/compound-engineering'). Empty for repo-root layouts."
-        ),
-    )
-    install_p.set_defaults(func=cmd_install)
+_USAGE = "Usage: /cc-import install <git-url> [--branch BRANCH] [--subdir SUBDIR]"
 
 
-def cmd_install(args: argparse.Namespace) -> int:
-    """Execute ``hermes cc-import install <git-url>``.
+def handle_command(raw_args: str) -> str:
+    """Dispatch a ``/cc-import`` invocation. Returns a result string for display."""
+    tokens = shlex.split((raw_args or "").strip())
+    if not tokens:
+        return _USAGE
 
-    Returns 0 on success, non-zero on any error (clone failure, parse
-    failure, unexpected exception). Errors are printed to stderr; success
-    output goes to stdout.
-    """
+    subcommand, rest = tokens[0], tokens[1:]
+    if subcommand == "install":
+        return _cmd_install(rest)
+    return f"Unknown subcommand: {subcommand!r}. Available: install\n{_USAGE}"
+
+
+def _cmd_install(argv: list[str]) -> str:
+    parser = _make_install_parser()
     try:
-        summary = converter.import_plugin(args.git_url, branch=args.branch, subdir=args.subdir)
+        ns = parser.parse_args(argv)
+    except SystemExit:
+        # argparse calls sys.exit on -h / parse errors; convert to a return
+        # string so the slash-command dispatcher can show the message.
+        return f"Error parsing arguments.\n{_USAGE}"
+
+    try:
+        summary = converter.import_plugin(ns.git_url, branch=ns.branch, subdir=ns.subdir)
     except subprocess.CalledProcessError as exc:
-        print(
-            f"Error: failed to clone {args.git_url} (git exit {exc.returncode}).",
-            file=sys.stderr,
-        )
-        return 1
+        return f"Error: failed to clone {ns.git_url} (git exit {exc.returncode})."
     except Exception as exc:
-        print(f"Error importing {args.git_url}: {exc}", file=sys.stderr)
-        return 1
+        return f"Error importing {ns.git_url}: {exc}"
 
-    parts = [
-        f"Imported {summary.plugin}:",
-        f"{summary.skills_imported} skills imported",
-        f"{summary.agents_translated} agents translated",
-    ]
+    return _format_summary(summary)
+
+
+def _make_install_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="/cc-import install",
+        description="Import a Claude Code plugin (skills + agents) from a git URL.",
+        add_help=False,
+    )
+    parser.add_argument("git_url")
+    parser.add_argument("--branch", default="main")
+    parser.add_argument("--subdir", default="")
+    return parser
+
+
+def _format_summary(summary) -> str:
+    head = (
+        f"Imported {summary.plugin}: "
+        f"{summary.skills_imported} skills imported, "
+        f"{summary.agents_translated} agents translated"
+    )
+    parts = [head]
     if summary.skills_unchanged or summary.agents_unchanged:
-        parts.append(f"({summary.skills_unchanged} + {summary.agents_unchanged} unchanged)")
-    print(" ".join(parts))
-
+        parts.append(
+            f"  ({summary.skills_unchanged} skills + {summary.agents_unchanged} agents unchanged)"
+        )
     if summary.skipped_user_modified:
-        print("\nUser-modified files preserved (not overwritten):")
+        parts.append("\nUser-modified files preserved (not overwritten):")
         for key in summary.skipped_user_modified:
-            print(f"  - {key}")
-
-    return 0
+            parts.append(f"  - {key}")
+    return "\n".join(parts)

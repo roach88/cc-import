@@ -1,5 +1,5 @@
-"""Tests for ``__init__.py`` — verifies ``register(ctx)`` wires only the CLI
-subcommand in slice 1.
+"""Tests for ``__init__.py`` — verifies ``register(ctx)`` wires only the
+slash command in slice 1.
 
 Slice 2 will add agent tools (``ctx.register_tool``); slice 3 will add the
 ``on_session_start`` hook (``ctx.register_hook``). These assertions guard
@@ -31,24 +31,24 @@ _PLUGIN = _load_plugin_init()
 
 
 class TestRegister:
-    """``register(ctx)`` — slice 1 wires CLI only, no tools, no hooks."""
+    """``register(ctx)`` — slice 1 wires slash command only, no tools, no hooks."""
 
-    def test_register_calls_register_cli_command_exactly_once(self):
+    def test_register_calls_register_command_exactly_once(self):
         ctx = MagicMock()
         _PLUGIN.register(ctx)
-        ctx.register_cli_command.assert_called_once()
+        ctx.register_command.assert_called_once()
 
-    def test_register_uses_cc_import_as_name(self):
+    def test_register_uses_cc_import_as_command_name(self):
         ctx = MagicMock()
         _PLUGIN.register(ctx)
-        kwargs = ctx.register_cli_command.call_args.kwargs
+        kwargs = ctx.register_command.call_args.kwargs
         assert kwargs.get("name") == "cc-import"
 
-    def test_register_passes_callable_setup_fn(self):
+    def test_register_passes_callable_handler(self):
         ctx = MagicMock()
         _PLUGIN.register(ctx)
-        kwargs = ctx.register_cli_command.call_args.kwargs
-        assert callable(kwargs.get("setup_fn"))
+        kwargs = ctx.register_command.call_args.kwargs
+        assert callable(kwargs.get("handler"))
 
     def test_register_does_not_register_tools(self):
         ctx = MagicMock()
@@ -60,7 +60,9 @@ class TestRegister:
         _PLUGIN.register(ctx)
         ctx.register_hook.assert_not_called()
 
-    def test_register_does_not_register_slash_commands(self):
+    def test_register_does_not_register_top_level_cli_command(self):
+        # register_cli_command's argparse wiring isn't actually consumed by
+        # Hermes main.py; we use register_command (slash command) instead.
         ctx = MagicMock()
         _PLUGIN.register(ctx)
-        ctx.register_command.assert_not_called()
+        ctx.register_cli_command.assert_not_called()

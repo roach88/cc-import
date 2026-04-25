@@ -15,23 +15,27 @@ hermes plugins enable cc-import
 
 ## Usage
 
-```sh
-hermes cc-import install <git-url> [--branch <name>] [--subdir <path>]
+cc-import exposes a `/cc-import` slash command, available in `hermes chat` and gateway sessions:
+
+```
+/cc-import install <git-url> [--branch BRANCH] [--subdir SUBDIR]
 ```
 
 Example — import EveryInc's compound-engineering plugin:
 
-```sh
-hermes cc-import install https://github.com/EveryInc/compound-engineering-plugin.git
+```
+/cc-import install https://github.com/EveryInc/compound-engineering-plugin.git
 ```
 
 Output:
 
 ```
-Imported compound-engineering: 36 skills imported 48 agents translated
+Imported compound-engineering: 36 skills imported, 48 agents translated
 ```
 
 The skills appear in `hermes skills list` immediately. Restart the gateway (`hermes gateway restart`) for them to take effect in active chat sessions.
+
+> **Note on top-level CLI:** Hermes's `register_cli_command` API is documented as wiring `hermes <plugin>` subcommands at startup, but the consuming code that would iterate plugin registrations into the top-level argparse is not yet present in `hermes_cli/main.py`. Until that gap is closed upstream, cc-import uses the slash-command surface, which is fully wired.
 
 ## How it works
 
