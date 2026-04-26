@@ -497,6 +497,23 @@ def _validate_plugin_name(name: str) -> None:
         )
 
 
+def _safe_clone_env() -> dict[str, str]:
+    """Return an env dict that suppresses git's system + global config (R10).
+
+    Combined with ``--config core.hooksPath=/dev/null`` and
+    ``--no-recurse-submodules`` flags on the ``git clone`` argv, this
+    eliminates the most common arbitrary-code-execution vectors in
+    cloned repos: post-checkout hooks, ``core.fsmonitor`` payloads in
+    a malicious ``.git/config``, and submodule recursion (per
+    CVE-2017-1000117 mitigation guidance).
+    """
+    return {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+
+
 def _validate_subdir(subdir: str, clone_root: Path) -> Path:
     """Resolve *subdir* against *clone_root* and assert it stays inside (R11).
 
