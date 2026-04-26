@@ -42,6 +42,17 @@ except ImportError:
 
 def register(ctx) -> None:
     """Register cc-import's slash command and agent tools with Hermes."""
+    # Defense-in-depth: the third-tier import fallback (cli=None, tools=None)
+    # exists for pytest's eager Package.setup() and should never fire in
+    # production. If it ever does — say, a future commit adds a sub-dependency
+    # to cli.py or tools.py that's missing from the Hermes runtime — fail
+    # loudly with the actual cause instead of a cryptic AttributeError later.
+    if cli is None or tools is None:
+        raise RuntimeError(
+            "cc-import failed to load its cli/tools modules — likely a missing "
+            "Python dependency in the Hermes environment. Check the Hermes "
+            "logs around plugin discovery for the underlying ImportError."
+        )
     ctx.register_command(
         name="cc-import",
         handler=cli.handle_command,

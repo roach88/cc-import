@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -272,7 +273,7 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
             branch,
             "--no-recurse-submodules",
             "--config",
-            "core.hooksPath=/dev/null",
+            f"core.hooksPath={os.devnull}",
             url,
             str(dest),
         ],
@@ -479,12 +480,16 @@ def _validate_url(url: str) -> None:
     Slash command callers do **not** invoke this — they're considered
     human-vetted. Tool handlers in :mod:`tools` do.
     """
-    from urllib.parse import urlparse
-
     if not isinstance(url, str) or not url.strip():
         raise ValueError("git_url is required and must be a non-empty string")
     if not url.startswith("https://"):
-        raise ValueError("git_url must use https scheme; got " + url.split("://", 1)[0] + "://")
+        # Don't echo the user-supplied URL in the error message. tool_error
+        # surfaces this and a malicious SCP-style URL (git@host:org/repo)
+        # would slip past _redact_paths.
+        raise ValueError(
+            "git_url must use the https:// scheme. SCP-style and other "
+            "non-HTTPS URLs are not permitted."
+        )
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if not host:
@@ -495,7 +500,10 @@ def _validate_url(url: str) -> None:
         )
 
 
-_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# First char must be alphanumeric (not a dot, dash, or underscore). This
+# rejects the special directory entries '.', '..', '.hidden', as well as
+# names that would be hidden in `ls` or behave oddly under shell globs.
+_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _validate_plugin_name(name: str) -> None:
@@ -503,13 +511,12 @@ def _validate_plugin_name(name: str) -> None:
 
     The name is used as a directory under ``skills/``, so any path-special
     character would let a malicious ``plugin.json`` write outside the
-    intended subtree. We require ASCII letters/digits/dot/dash/underscore
-    and reject the literal ``..`` traversal token.
+    intended subtree. We require an alphanumeric leading character, then
+    only ASCII letters/digits/dot/dash/underscore — which together reject
+    ``.``, ``..``, ``.hidden``, and shell-meta-character names.
     """
     if not isinstance(name, str) or not name:
         raise ValueError("plugin_name is required and must be a non-empty string")
-    if name == "..":
-        raise ValueError("plugin_name cannot be '..'")
     if not _PLUGIN_NAME_RE.match(name):
         raise ValueError(
             f"plugin_name {name!r} contains disallowed characters (only [A-Za-z0-9._-] permitted)"
@@ -519,17 +526,18 @@ def _validate_plugin_name(name: str) -> None:
 def _safe_clone_env() -> dict[str, str]:
     """Return an env dict that suppresses git's system + global config (R10).
 
-    Combined with ``--config core.hooksPath=/dev/null`` and
-    ``--no-recurse-submodules`` flags on the ``git clone`` argv, this
-    eliminates the most common arbitrary-code-execution vectors in
-    cloned repos: post-checkout hooks, ``core.fsmonitor`` payloads in
-    a malicious ``.git/config``, and submodule recursion (per
-    CVE-2017-1000117 mitigation guidance).
+    The env vars only suppress system and global git config — they do not
+    suppress hooks. Hook suppression comes from the
+    ``--config core.hooksPath=...`` flag passed to ``git clone``, which
+    persists into the cloned repo's ``.git/config`` and is therefore
+    inherited by subsequent fetch/reset operations on that repo. With
+    ``--no-recurse-submodules`` added on the clone argv, this combination
+    addresses the CVE-2017-1000117 vector class.
     """
     return {
         **os.environ,
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_GLOBAL": os.devnull,
     }
 
 

@@ -22,10 +22,13 @@ at planning time, not just after the call.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 from dataclasses import asdict
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Three-tier import for converter / state, mirroring slice-1's pattern.
 try:
@@ -58,7 +61,10 @@ except ImportError:  # pragma: no cover - production-import shape covered by smo
         return json.dumps(body)
 
 
-_PATH_RE = re.compile(r"/[A-Za-z][\w./-]*")
+# Match absolute path-like substrings. Each component starts with at least
+# one path-allowed char (alnum, dot, dash, underscore) so digit-starting
+# components like /proc/1234 / /tmp/456-foo are also redacted.
+_PATH_RE = re.compile(r"/[\w.][\w./-]*")
 
 
 def _redact_paths(text: str) -> str:
@@ -125,6 +131,7 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
         }
         return tool_result(payload)
     except Exception as exc:
+        logger.exception("cc_import_install internal error")
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
@@ -134,6 +141,7 @@ def _handle_list(args: dict[str, Any], **_kwargs: Any) -> str:
         entries = state.list_imports()
         return tool_result({"plugins": [asdict(e) for e in entries]})
     except Exception as exc:
+        logger.exception("cc_import_list internal error")
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
@@ -145,10 +153,12 @@ def _handle_remove(args: dict[str, Any], **_kwargs: Any) -> str:
             return tool_error("missing_arg", "plugin is required")
         plugin = plugin_raw.strip()
 
-        # R5: tool surface never accepts force. If an agent passes it, surface
+        # R5: tool surface never accepts a truthy force. Falsy force=False is
+        # tolerated (compliant dispatchers may serialize all schema-declared
+        # bool fields with explicit false defaults). A truthy force surfaces
         # an explicit error so the agent's planner learns the constraint
         # rather than silently dropping the flag.
-        if "force" in args:
+        if args.get("force"):
             return tool_error(
                 "invalid_arg",
                 "force is not supported via the agent tool surface; "
@@ -158,14 +168,18 @@ def _handle_remove(args: dict[str, Any], **_kwargs: Any) -> str:
         dry_run = bool(args.get("dry_run", False))
 
         result = state.remove_import(plugin, force=False, dry_run=dry_run)
-        payload: dict[str, Any] = {
-            **asdict(result),
-            "available_now": False,
-            "available_after": "next_session",
-            "notice": _REMOVE_NOTICE,
-        }
+        payload: dict[str, Any] = asdict(result)
+        # Deferred-state contract: only attach the "restart Hermes" notice
+        # when an actual change happened. dry_run and no_changes paths
+        # don't change disk state, so the restart instruction would
+        # mislead the agent.
+        if not dry_run and not result.no_changes:
+            payload["available_now"] = False
+            payload["available_after"] = "next_session"
+            payload["notice"] = _REMOVE_NOTICE
         return tool_result(payload)
     except Exception as exc:
+        logger.exception("cc_import_remove internal error")
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
@@ -185,6 +199,7 @@ _INSTALL_SCHEMA: dict[str, Any] = {
     ),
     "parameters": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "git_url": {
                 "type": "string",
@@ -218,6 +233,7 @@ _LIST_SCHEMA: dict[str, Any] = {
     ),
     "parameters": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {},
         "required": [],
     },
@@ -229,12 +245,14 @@ _REMOVE_SCHEMA: dict[str, Any] = {
     "description": (
         "Remove an installed Claude Code plugin (skills + agents + clone "
         "cache). User-edited files are always preserved (use the slash "
-        "command if force-removal is needed). "
+        "command if force-removal is needed). Pass dry_run=true first to "
+        "preview what would be removed without writing. "
         "IMPORTANT: removal takes effect on the next Hermes session. "
         "Stop after success and tell the user to restart Hermes."
     ),
     "parameters": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "plugin": {
                 "type": "string",

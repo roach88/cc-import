@@ -18,7 +18,15 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+CloneCacheStatus = Literal[
+    "removed",
+    "already_missing",
+    "skipped_unfindable",
+    "skipped_path_outside_anchor",
+    "not_attempted",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +122,7 @@ class RemoveResult:
     removed_skills: int = 0
     removed_agents: int = 0
     kept_user_modified: list[str] = field(default_factory=list)
-    clone_cache_status: str = "not_attempted"
+    clone_cache_status: CloneCacheStatus = "not_attempted"
     clone_cache_path: str | None = None
     no_changes: bool = False
 
@@ -124,7 +132,7 @@ def _find_clone_cache(
     plugins_index: dict[str, dict[str, Any]],
     plugin_name: str,
     target_entries: list[dict[str, Any]],
-) -> tuple[str, Path | None]:
+) -> tuple[CloneCacheStatus, Path | None]:
     """Locate the clone cache directory for *plugin_name*.
 
     Returns ``(status, path | None)``. The path is *unresolved* so the

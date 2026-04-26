@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import subprocess
 from dataclasses import asdict
@@ -24,6 +25,17 @@ try:
 except ImportError:
     import converter  # type: ignore[no-redef]
     import state  # type: ignore[no-redef]
+
+
+# Slash-surface path redaction. The agent tool surface uses tools._redact_paths;
+# slash output may also reach an agent (gateway sessions, transcript replay),
+# so apply the same discipline before returning exception text.
+_PATH_RE = re.compile(r"/[\w.][\w./-]*")
+
+
+def _redact_paths(text: str) -> str:
+    return _PATH_RE.sub("<path>", text or "")
+
 
 _USAGE = (
     "Usage: /cc-import install <git-url> [--branch BRANCH] [--subdir SUBDIR]\n"
@@ -62,7 +74,7 @@ def _cmd_install(argv: list[str]) -> str:
     except subprocess.CalledProcessError as exc:
         return f"Error: failed to clone {ns.git_url} (git exit {exc.returncode})."
     except Exception as exc:
-        return f"Error importing {ns.git_url}: {exc}"
+        return _redact_paths(f"Error importing {ns.git_url}: {exc}")
 
     return _format_summary(summary)
 
@@ -79,7 +91,7 @@ def _make_install_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_summary(summary) -> str:
+def _format_summary(summary: converter.ImportSummary) -> str:
     head = (
         f"Imported {summary.plugin}: "
         f"{summary.skills_imported} skills imported, "
@@ -107,7 +119,7 @@ def _cmd_list(argv: list[str]) -> str:
     try:
         entries = state.list_imports()
     except Exception as exc:
-        return f"Error: list failed: {exc}"
+        return _redact_paths(f"Error: list failed: {exc}")
 
     if ns.json:
         return json.dumps([asdict(e) for e in entries], indent=2)
@@ -124,7 +136,7 @@ def _make_list_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_list_text(entries) -> str:
+def _format_list_text(entries: list[state.PluginListEntry]) -> str:
     if not entries:
         return "No plugins installed."
     name_w = max(len(e.name) for e in entries)
@@ -146,7 +158,7 @@ def _cmd_remove(argv: list[str]) -> str:
     try:
         result = state.remove_import(ns.plugin, force=ns.force, dry_run=ns.dry_run)
     except Exception as exc:
-        return f"Error removing {ns.plugin}: {exc}"
+        return _redact_paths(f"Error removing {ns.plugin}: {exc}")
 
     return _format_remove(result)
 
@@ -171,7 +183,7 @@ def _make_remove_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_remove(result) -> str:
+def _format_remove(result: state.RemoveResult) -> str:
     if result.no_changes:
         return f"No changes: {result.plugin} is not installed."
     verb = "Would remove" if result.dry_run else "Removed"
@@ -181,10 +193,16 @@ def _format_remove(result) -> str:
         parts.append("\nUser-modified files preserved (use --force to delete them):")
         for key in result.kept_user_modified:
             parts.append(f"  - {key}")
-    if result.clone_cache_status == "removed":
+    status = result.clone_cache_status
+    if status == "removed":
         parts.append(f"  clone cache: removed ({result.clone_cache_path})")
-    elif result.clone_cache_status == "skipped_path_outside_anchor":
+    elif status == "already_missing":
+        parts.append(f"  clone cache: already missing ({result.clone_cache_path})")
+    elif status == "skipped_path_outside_anchor":
         parts.append("  clone cache: skipped (path outside cc-import state dir)")
-    elif result.clone_cache_status == "skipped_unfindable":
+    elif status == "skipped_unfindable":
         parts.append("  clone cache: skipped (could not locate)")
+    elif status == "not_attempted":
+        # Reachable when all entries are kept user-modified (no deletions ran)
+        parts.append("  clone cache: not modified (no deletions occurred)")
     return "\n".join(parts)
