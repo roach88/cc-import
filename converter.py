@@ -211,13 +211,21 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write *manifest* to *path* as deterministic, diff-friendly JSON.
+    """Write *manifest* to *path* atomically via ``.tmp`` + ``os.replace``.
 
     Creates parent directories if missing. Output uses ``indent=2`` and
     ``sort_keys=True`` so successive saves produce stable diffs.
+
+    Atomic-rename mitigates torn writes under concurrent invocations
+    (slice 2 R6). It does not serialize concurrent callers — single-
+    threaded use remains the documented assumption — but a process
+    killed mid-write leaves either the prior valid file or no file at
+    all, never a half-written one.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
