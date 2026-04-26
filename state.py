@@ -214,7 +214,7 @@ def remove_import(
     # Decide per-entry: delete or keep (user-modified).
     to_delete: list[tuple[str, dict[str, Any]]] = []
     kept: list[str] = []
-    for key, entry in zip(target_keys, target_entries):
+    for key, entry in zip(target_keys, target_entries, strict=True):
         dest_md = skills_dir / key / "SKILL.md"
         delete_this = True
         if dest_md.exists() and not force:
@@ -234,9 +234,7 @@ def remove_import(
     removed_agents = sum(1 for _, e in to_delete if e.get("kind") == "agent")
 
     # Determine clone cache (still meaningful even in dry_run for reporting).
-    cache_status, cache_path = _find_clone_cache(
-        home, plugins_index, plugin_name, target_entries
-    )
+    cache_status, cache_path = _find_clone_cache(home, plugins_index, plugin_name, target_entries)
     cache_path_str = str(cache_path) if cache_path is not None else None
 
     if dry_run:

@@ -15,7 +15,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -453,7 +453,7 @@ def _now_iso() -> str:
     seconds precision with a trailing ``Z`` so successive saves produce
     stable, sortable, jq-friendly timestamps.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # Hostnames an agent-callable installer is allowed to clone from. Slice 2
@@ -484,17 +484,14 @@ def _validate_url(url: str) -> None:
     if not isinstance(url, str) or not url.strip():
         raise ValueError("git_url is required and must be a non-empty string")
     if not url.startswith("https://"):
-        raise ValueError(
-            "git_url must use https scheme; got " + url.split("://", 1)[0] + "://"
-        )
+        raise ValueError("git_url must use https scheme; got " + url.split("://", 1)[0] + "://")
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if not host:
         raise ValueError("git_url has no parseable hostname")
     if host not in _ALLOWED_HOSTS:
         raise ValueError(
-            f"git_url host {host!r} is not on the allowlist "
-            f"({', '.join(sorted(_ALLOWED_HOSTS))})"
+            f"git_url host {host!r} is not on the allowlist ({', '.join(sorted(_ALLOWED_HOSTS))})"
         )
 
 
@@ -515,8 +512,7 @@ def _validate_plugin_name(name: str) -> None:
         raise ValueError("plugin_name cannot be '..'")
     if not _PLUGIN_NAME_RE.match(name):
         raise ValueError(
-            f"plugin_name {name!r} contains disallowed characters "
-            f"(only [A-Za-z0-9._-] permitted)"
+            f"plugin_name {name!r} contains disallowed characters (only [A-Za-z0-9._-] permitted)"
         )
 
 
@@ -549,9 +545,7 @@ def _validate_subdir(subdir: str, clone_root: Path) -> Path:
     root = clone_root.resolve()
     candidate = (clone_root / subdir).resolve() if subdir else root
     if not (candidate == root or candidate.is_relative_to(root)):
-        raise ValueError(
-            f"subdir {subdir!r} resolves outside clone root {clone_root}"
-        )
+        raise ValueError(f"subdir {subdir!r} resolves outside clone root {clone_root}")
     return candidate
 
 

@@ -125,8 +125,11 @@ class TestListSubcommand:
             "list_imports",
             lambda **_kw: [
                 _STATE.PluginListEntry(
-                    name="fp", skills_count=2, agents_count=1,
-                    url="https://github.com/Foo/Bar.git", branch="main",
+                    name="fp",
+                    skills_count=2,
+                    agents_count=1,
+                    url="https://github.com/Foo/Bar.git",
+                    branch="main",
                     imported_at="2026-04-25T16:00:00Z",
                 ),
             ],
@@ -144,8 +147,12 @@ class TestListSubcommand:
             "list_imports",
             lambda **_kw: [
                 _STATE.PluginListEntry(
-                    name="fp", skills_count=2, agents_count=1,
-                    url="u", branch="main", imported_at="t",
+                    name="fp",
+                    skills_count=2,
+                    agents_count=1,
+                    url="u",
+                    branch="main",
+                    imported_at="t",
                 ),
             ],
         )

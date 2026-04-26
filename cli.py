@@ -45,10 +45,7 @@ def handle_command(raw_args: str) -> str:
         return _cmd_list(rest)
     if subcommand == "remove":
         return _cmd_remove(rest)
-    return (
-        f"Unknown subcommand: {subcommand!r}. Available: install, list, remove\n"
-        f"{_USAGE}"
-    )
+    return f"Unknown subcommand: {subcommand!r}. Available: install, list, remove\n{_USAGE}"
 
 
 def _cmd_install(argv: list[str]) -> str:
@@ -109,7 +106,7 @@ def _cmd_list(argv: list[str]) -> str:
 
     try:
         entries = state.list_imports()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"Error: list failed: {exc}"
 
     if ns.json:
@@ -135,9 +132,7 @@ def _format_list_text(entries) -> str:
     lines = [f"{'NAME':<{name_w}}  SKILLS  AGENTS  URL"]
     for e in entries:
         url = e.url or "-"
-        lines.append(
-            f"{e.name:<{name_w}}  {e.skills_count:>6}  {e.agents_count:>6}  {url}"
-        )
+        lines.append(f"{e.name:<{name_w}}  {e.skills_count:>6}  {e.agents_count:>6}  {url}")
     return "\n".join(lines)
 
 
@@ -149,10 +144,8 @@ def _cmd_remove(argv: list[str]) -> str:
         return f"Error parsing arguments.\n{_USAGE}"
 
     try:
-        result = state.remove_import(
-            ns.plugin, force=ns.force, dry_run=ns.dry_run
-        )
-    except Exception as exc:  # noqa: BLE001
+        result = state.remove_import(ns.plugin, force=ns.force, dry_run=ns.dry_run)
+    except Exception as exc:
         return f"Error removing {ns.plugin}: {exc}"
 
     return _format_remove(result)
@@ -182,16 +175,10 @@ def _format_remove(result) -> str:
     if result.no_changes:
         return f"No changes: {result.plugin} is not installed."
     verb = "Would remove" if result.dry_run else "Removed"
-    head = (
-        f"{verb} {result.plugin}: "
-        f"{result.removed_skills} skills, {result.removed_agents} agents"
-    )
+    head = f"{verb} {result.plugin}: {result.removed_skills} skills, {result.removed_agents} agents"
     parts = [head]
     if result.kept_user_modified:
-        parts.append(
-            "\nUser-modified files preserved "
-            "(use --force to delete them):"
-        )
+        parts.append("\nUser-modified files preserved (use --force to delete them):")
         for key in result.kept_user_modified:
             parts.append(f"  - {key}")
     if result.clone_cache_status == "removed":

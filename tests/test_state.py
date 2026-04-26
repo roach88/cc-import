@@ -10,8 +10,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 
 def _load_module(name: str, filename: str):
     repo_root = Path(__file__).resolve().parents[1]

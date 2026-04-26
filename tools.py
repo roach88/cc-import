@@ -106,9 +106,7 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
             return tool_error(code, str(exc))
 
         try:
-            summary = converter.import_plugin(
-                git_url, branch=branch, subdir=subdir
-            )
+            summary = converter.import_plugin(git_url, branch=branch, subdir=subdir)
         except subprocess.CalledProcessError as exc:
             return tool_error(
                 "clone_failed",
@@ -126,7 +124,7 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
             "notice": _NEXT_SESSION_NOTICE,
         }
         return tool_result(payload)
-    except Exception as exc:  # noqa: BLE001 - convert to tool_error explicitly
+    except Exception as exc:
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
@@ -135,7 +133,7 @@ def _handle_list(args: dict[str, Any], **_kwargs: Any) -> str:
     try:
         entries = state.list_imports()
         return tool_result({"plugins": [asdict(e) for e in entries]})
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
@@ -167,7 +165,7 @@ def _handle_remove(args: dict[str, Any], **_kwargs: Any) -> str:
             "notice": _REMOVE_NOTICE,
         }
         return tool_result(payload)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return tool_error("internal_error", _redact_paths(f"{type(exc).__name__}: {exc}"))
 
 
