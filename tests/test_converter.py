@@ -1130,3 +1130,45 @@ class TestValidateUrl:
     def test_garbage_string_raises(self):
         with pytest.raises(ValueError):
             _CONVERTER._validate_url("not a url at all")
+
+
+class TestValidatePluginName:
+    """``_validate_plugin_name(name)`` — closes plugin.json traversal gap (R11)."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "compound-engineering",
+            "foo_bar",
+            "foo.v2",
+            "Foo-Bar_v3.0",
+            "a",
+        ],
+    )
+    def test_safe_names_pass(self, name):
+        _CONVERTER._validate_plugin_name(name)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "../core",
+            "..",
+            "/etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "../../../.ssh",
+            "foo bar",  # space
+            "foo:bar",  # colon
+        ],
+    )
+    def test_traversal_or_path_chars_raise(self, name):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name(name)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name("")
+
+    def test_non_ascii_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name("café")
