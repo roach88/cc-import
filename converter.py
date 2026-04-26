@@ -630,6 +630,20 @@ def _validate_url(url: str) -> None:
         raise ValueError(
             f"git_url host {host!r} is not on the allowlist ({', '.join(sorted(_ALLOWED_HOSTS))})"
         )
+    # R11: reject URLs whose derived clone basename would escape the clones/
+    # subtree. _repo_basename on ``https://github.com/foo/..`` yields ``..``
+    # → ``clone_dest = clones/..`` resolves to the cc-import state dir,
+    # where clone_or_update's "exists but not a git checkout" branch runs
+    # ``shutil.rmtree(dest)`` BEFORE clone — wiping state.json. ``foo/.``
+    # and ``foo/.git``-stripped-to-``""`` collapse onto the clones/ root
+    # itself, wiping every plugin's clone cache. Same character class as
+    # _validate_plugin_name since both end up as directory names.
+    basename = _repo_basename(url)
+    if not basename or not _PLUGIN_NAME_RE.match(basename):
+        raise ValueError(
+            f"git_url derives unsafe clone basename {basename!r} "
+            "(must start with alphanumeric and contain only [A-Za-z0-9._-])"
+        )
 
 
 def _sanitize_url(url: str) -> str:
@@ -763,6 +777,17 @@ def import_plugin(
     manifest_path = state_dir / "state.json"
 
     repo_basename = _repo_basename(git_url)
+    # R11: defense-in-depth basename check. Slash command bypasses
+    # ``_validate_url`` (which already enforces this on the agent surface),
+    # so re-validate here before constructing ``clone_dest`` — a basename
+    # like ``..`` or ``.`` would otherwise resolve clone_dest onto the
+    # cc-import state dir or the clones/ root, where clone_or_update's
+    # rmtree-before-clone path would wipe it.
+    if not repo_basename or not _PLUGIN_NAME_RE.match(repo_basename):
+        raise ValueError(
+            f"git_url derives unsafe clone basename {repo_basename!r} "
+            "(must start with alphanumeric and contain only [A-Za-z0-9._-])"
+        )
     clone_dest = clone_root / repo_basename
 
     clone_or_update(git_url, branch, clone_dest)

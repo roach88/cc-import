@@ -97,8 +97,15 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
         try:
             converter._validate_url(git_url)
         except ValueError as exc:
+            # Only the host-allowlist rejection message contains the unique
+            # substring ``"allowlist"``. The earlier substring check also
+            # matched ``"host"``, which incorrectly reclassified credential
+            # URLs (whose message contains ``"user:token@host"``) as
+            # ``disallowed_host``. Other ValueError reasons (scheme,
+            # credentials, basename, missing hostname) all map to
+            # ``invalid_arg``.
             msg = str(exc).lower()
-            code = "disallowed_host" if "host" in msg or "allowlist" in msg else "invalid_arg"
+            code = "disallowed_host" if "allowlist" in msg else "invalid_arg"
             return tool_error(code, str(exc))
 
         try:

@@ -100,6 +100,29 @@ class TestHandleInstall:
         out = _result(_TOOLS._handle_install({"git_url": "file:///tmp/repo"}))
         assert out["error"] == "invalid_arg"
 
+    def test_credential_url_returns_invalid_arg_not_disallowed_host(self):
+        """Greptile P2: credential URLs must not be misclassified as disallowed_host.
+
+        The dispatch used to substring-match ``"host"`` in the message,
+        which matched the literal ``"user:token@host"`` example inside
+        the credential-rejection text. Only ``"allowlist"`` (unique to
+        the host-allowlist message) should pick disallowed_host.
+        """
+        out = _result(
+            _TOOLS._handle_install({"git_url": "https://user:token@github.com/Foo/Bar.git"})
+        )
+        assert out["error"] == "invalid_arg", (
+            f"credential URL should be invalid_arg, got {out['error']}: {out.get('message')}"
+        )
+
+    def test_unsafe_basename_url_returns_invalid_arg_error(self):
+        """Greptile P1: ..-tailed allowlisted URL must reject before any clone."""
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/foo/.."}))
+        assert out["error"] == "invalid_arg"
+        assert (
+            "basename" in out.get("message", "").lower() or "safe" in out.get("message", "").lower()
+        )
+
     def test_clone_failure_returns_clone_failed_error(self, monkeypatch):
         def fake_import(*_a, **_kw):
             raise subprocess.CalledProcessError(returncode=128, cmd=["git", "clone"])

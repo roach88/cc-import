@@ -1190,6 +1190,25 @@ class TestValidateUrl:
         with pytest.raises(ValueError, match=r"(?i)credential"):
             _CONVERTER._validate_url(url)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Greptile P1 (security): _repo_basename of these yields '..',
+            # '.', or '' — clone_dest would then resolve onto the cc-import
+            # state dir or the clones/ root, where clone_or_update's
+            # rmtree-before-clone path would wipe state.json or every
+            # clone cache.
+            "https://github.com/foo/..",  # basename → '..' → state_dir
+            "https://github.com/foo/.",  # basename → '.' → clones root
+            "https://github.com/foo/..git",  # .git-strip → '.' → clones root
+            "https://github.com/foo/.git",  # .git-strip → '' → clones root
+            "https://github.com/.git",  # .git-strip → '' → clones root
+        ],
+    )
+    def test_unsafe_clone_basenames_rejected(self, url):
+        with pytest.raises(ValueError, match=r"(?i)basename|safe"):
+            _CONVERTER._validate_url(url)
+
 
 class TestSanitizeUrl:
     """``_sanitize_url`` strips userinfo for the slash-command path (R10 belt-and-suspenders)."""
@@ -1587,3 +1606,24 @@ class TestImportPluginSchemaV2:
             _CONVERTER.import_plugin(
                 f"file://{bare_upstream}", subdir="../etc", hermes_home=hermes_home
             )
+
+    def test_dotdot_basename_url_does_not_wipe_state_dir(self, tmp_path):
+        """Greptile P1 (security): slash command path must reject ..-tailed URLs.
+
+        ``_validate_url`` is bypassed on the slash surface, so the
+        defense-in-depth basename check inside ``import_plugin`` is the
+        only thing standing between a malformed/malicious URL and
+        ``shutil.rmtree`` running against the cc-import state dir.
+        Pre-seed a sentinel under the state dir and assert it survives a
+        rejected import attempt.
+        """
+        hermes_home = tmp_path / "alt-hermes"
+        state_dir = hermes_home / "plugins" / "cc-import"
+        state_dir.mkdir(parents=True)
+        sentinel = state_dir / "state.json"
+        sentinel.write_text('{"_plugins": {"existing": {"branch": "main"}}}')
+
+        with pytest.raises(ValueError, match=r"(?i)basename|safe"):
+            _CONVERTER.import_plugin("https://github.com/foo/..", hermes_home=hermes_home)
+        assert sentinel.exists()
+        assert "existing" in sentinel.read_text()
