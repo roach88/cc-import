@@ -1281,3 +1281,31 @@ class TestCloneOrUpdateHardening:
             assert env is not None
             assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
             assert env.get("GIT_CONFIG_GLOBAL") == "/dev/null"
+
+
+class TestSaveManifestAtomic:
+    """``save_manifest`` writes via ``.tmp`` + ``os.replace`` for atomicity.
+
+    Slice 1's :class:`TestManifestIO` covers the round-trip + create-parents
+    behavior. This class adds the atomic-rename guarantees from slice 2 R6.
+    """
+
+    def test_writes_atomically_via_temp_file(self, tmp_path):
+        path = tmp_path / "state.json"
+        # Pre-existing valid manifest
+        _CONVERTER.save_manifest(path, {"x": {"plugin": "y"}})
+        assert path.exists()
+        # No leftover .tmp file after success
+        assert not (tmp_path / "state.json.tmp").exists()
+
+    def test_overwrites_stale_tmp_from_prior_crash(self, tmp_path):
+        path = tmp_path / "state.json"
+        stale_tmp = tmp_path / "state.json.tmp"
+        # Simulate a crash mid-write: stale .tmp from a prior run
+        stale_tmp.write_text("garbage from interrupted save")
+        # New save should overwrite the stale .tmp and produce a valid final file
+        _CONVERTER.save_manifest(path, {"k": {"plugin": "p"}})
+        loaded = _CONVERTER.load_manifest(path)
+        assert loaded == {"k": {"plugin": "p"}}
+        # .tmp is consumed by the rename, not left behind
+        assert not stale_tmp.exists()
