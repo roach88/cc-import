@@ -614,10 +614,26 @@ def import_plugin(
 
     clone_or_update(git_url, branch, clone_dest)
 
-    plugin_root = clone_dest / subdir if subdir else clone_dest
+    # R11: validate subdir against the resolved clone root before any read.
+    plugin_root = _validate_subdir(subdir, clone_dest)
     plugin_name = _resolve_plugin_name(plugin_root, repo_basename)
+    # R11: validate plugin name (could come from a malicious plugin.json)
+    # before using it as a directory under skills_dir.
+    _validate_plugin_name(plugin_name)
 
     manifest = load_manifest(manifest_path)
+    # R6: install-cache index. Preserve url/branch/subdir on rerun;
+    # always refresh imported_at. Slice 3's sources.yaml will become the
+    # canonical user-intent store; this remains the derived cache.
+    plugins_index = manifest.setdefault("_plugins", {})
+    existing = plugins_index.get(plugin_name, {})
+    plugins_index[plugin_name] = {
+        "url": existing.get("url", git_url),
+        "branch": existing.get("branch", branch),
+        "subdir": existing.get("subdir", subdir),
+        "imported_at": _now_iso(),
+    }
+
     summary = ImportSummary(plugin=plugin_name)
     seen_keys: set[str] = set()
 
