@@ -15,16 +15,27 @@ works in interactive sessions and gateway adapters.
 
 from __future__ import annotations
 
-# Hermes loads this plugin as a namespace-package member (sets
-# ``module.__package__`` and ``module.__path__`` before exec), so the
-# relative import succeeds in production. Pytest, by contrast, imports
-# ``__init__.py`` at the repo root without any package context, so the
-# relative form raises ImportError; the absolute fallback then finds
-# ``cli.py`` via the repo root on ``sys.path``.
+# Three-tier ``cli`` import:
+#
+# 1. Hermes loads this plugin as a namespace-package member (sets
+#    ``module.__package__`` and ``module.__path__`` before exec), so the
+#    relative import succeeds in production.
+# 2. Tests in ``tests/test_cli.py`` load ``__init__.py`` via
+#    ``importlib.util`` after inserting the repo root into ``sys.path``,
+#    so the absolute fallback finds ``cli.py``.
+# 3. Pytest's :class:`_pytest.python.Package` setup eagerly imports any
+#    ``__init__.py`` it finds at the rootpath without package context
+#    AND without inserting the repo root into ``sys.path``. Both prior
+#    fallbacks fail; ``cli`` is set to ``None`` so module load completes
+#    cleanly. ``register()`` is never invoked in that context, so the
+#    ``None`` value is harmless.
 try:
     from . import cli
 except ImportError:
-    import cli  # type: ignore[no-redef]
+    try:
+        import cli  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        cli = None  # type: ignore[assignment]
 
 
 def register(ctx) -> None:
