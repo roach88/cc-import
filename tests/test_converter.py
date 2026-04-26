@@ -1172,3 +1172,31 @@ class TestValidatePluginName:
     def test_non_ascii_raises(self):
         with pytest.raises(ValueError):
             _CONVERTER._validate_plugin_name("café")
+
+
+class TestValidateSubdir:
+    """``_validate_subdir(subdir, clone_root)`` — closes path-traversal gap (R11)."""
+
+    def test_empty_subdir_returns_clone_root(self, tmp_path):
+        result = _CONVERTER._validate_subdir("", tmp_path)
+        assert result == tmp_path.resolve()
+
+    def test_relative_subdir_resolves_under_clone_root(self, tmp_path):
+        nested = tmp_path / "plugins" / "foo"
+        nested.mkdir(parents=True)
+        result = _CONVERTER._validate_subdir("plugins/foo", tmp_path)
+        assert result == nested.resolve()
+
+    @pytest.mark.parametrize(
+        "subdir",
+        [
+            "../etc",
+            "..",
+            "/etc/passwd",
+            "plugins/../../etc",
+            "/absolute/path",
+        ],
+    )
+    def test_traversal_raises(self, tmp_path, subdir):
+        with pytest.raises(ValueError, match=r"(?i)subdir|escape|outside"):
+            _CONVERTER._validate_subdir(subdir, tmp_path)
