@@ -12,3 +12,5 @@ dist/
 build/
 .coverage
 .DS_Store
+.context/
+uv.lock

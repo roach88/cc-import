@@ -1131,6 +1131,16 @@ class TestValidateUrl:
         with pytest.raises(ValueError):
             _CONVERTER._validate_url("not a url at all")
 
+    def test_scp_style_url_does_not_leak_in_error_message(self):
+        # SCP-style URL (git@host:org/repo) bypasses urlparse's scheme parser.
+        # The error message must NOT echo the user-supplied URL — that would
+        # let it slip past _redact_paths in the tool handler.
+        scp_url = "git@github.com:Foo/Bar.git"
+        with pytest.raises(ValueError) as excinfo:
+            _CONVERTER._validate_url(scp_url)
+        assert scp_url not in str(excinfo.value)
+        assert "git@github.com" not in str(excinfo.value)
+
 
 class TestValidatePluginName:
     """``_validate_plugin_name(name)`` — closes plugin.json traversal gap (R11)."""
@@ -1153,12 +1163,17 @@ class TestValidatePluginName:
         [
             "../core",
             "..",
+            ".",  # current-dir reference: would resolve plugin_dest to skills_dir itself
+            "...",
+            ".hidden",  # leading dot: hidden dir, surprising under `ls`
             "/etc/passwd",
             "foo/bar",
             "foo\\bar",
             "../../../.ssh",
             "foo bar",  # space
             "foo:bar",  # colon
+            "-foo",  # leading dash: could be parsed as a flag elsewhere
+            "_internal",  # leading underscore
         ],
     )
     def test_traversal_or_path_chars_raise(self, name):
@@ -1210,8 +1225,12 @@ class TestSafeCloneEnv:
         assert env["GIT_CONFIG_NOSYSTEM"] == "1"
 
     def test_disables_global_config(self):
+        import os as _os
+
         env = _CONVERTER._safe_clone_env()
-        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        # os.devnull is the portable null device path (POSIX: /dev/null,
+        # Windows: NUL). Slice 2 switched away from a hardcoded "/dev/null".
+        assert env["GIT_CONFIG_GLOBAL"] == _os.devnull
 
     def test_inherits_path(self, monkeypatch):
         # PATH must propagate so subprocess can find git
@@ -1223,13 +1242,15 @@ class TestSafeCloneEnv:
 class TestCloneOrUpdateHardening:
     """``clone_or_update`` security hardening (R10).
 
-    Verifies the clone command argv carries ``--config core.hooksPath=/dev/null``
+    Verifies the clone command argv carries ``--config core.hooksPath=<devnull>``
     and ``--no-recurse-submodules``, and that all subprocess calls receive
     the safe env. End-to-end clone success is already covered by slice 1's
     :class:`TestCloneOrUpdate` against a real bare repo.
     """
 
     def test_clone_argv_disables_hooks_and_submodules(self, tmp_path, bare_upstream):
+        import os as _os
+
         captured: list[list[str]] = []
         captured_env: list[dict[str, str] | None] = []
         real_run = subprocess.run
@@ -1250,14 +1271,16 @@ class TestCloneOrUpdateHardening:
         assert "--no-recurse-submodules" in clone_argv
         assert "--config" in clone_argv
         cfg_idx = clone_argv.index("--config")
-        assert clone_argv[cfg_idx + 1] == "core.hooksPath=/dev/null"
+        assert clone_argv[cfg_idx + 1] == f"core.hooksPath={_os.devnull}"
         # Env carries the safe-env vars
         env = captured_env[0]
         assert env is not None
         assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
-        assert env.get("GIT_CONFIG_GLOBAL") == "/dev/null"
+        assert env.get("GIT_CONFIG_GLOBAL") == _os.devnull
 
     def test_fetch_and_reset_use_safe_env(self, tmp_path, bare_upstream):
+        import os as _os
+
         # First clone (no spy) to set up the cached checkout
         dest = tmp_path / "dest"
         _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
@@ -1280,7 +1303,7 @@ class TestCloneOrUpdateHardening:
         for env in captured_env:
             assert env is not None
             assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
-            assert env.get("GIT_CONFIG_GLOBAL") == "/dev/null"
+            assert env.get("GIT_CONFIG_GLOBAL") == _os.devnull
 
 
 class TestSaveManifestAtomic:

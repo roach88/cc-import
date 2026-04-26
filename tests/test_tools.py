@@ -120,14 +120,14 @@ class TestHandleInstall:
     def test_generic_exception_becomes_internal_error_with_redacted_path(self, monkeypatch):
         def fake_import(*_a, **_kw):
             raise RuntimeError(
-                "FileNotFoundError: [Errno 2] No such file: '/Users/tyler/.hermes/x'"
+                "FileNotFoundError: [Errno 2] No such file: '/home/someuser/.hermes/x'"
             )
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
         out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
         assert out["error"] == "internal_error"
         msg = out.get("message", "")
-        assert "/Users/tyler" not in msg
+        assert "/home/someuser" not in msg
         assert "<path>" in msg
 
 
@@ -207,11 +207,23 @@ class TestHandleRemove:
         # Force is NEVER passed through
         assert captured.get("force") is False
 
-    def test_force_field_returns_invalid_arg_error(self):
-        # The tool surface explicitly rejects force; slash command only
+    def test_force_true_returns_invalid_arg_error(self):
+        # The tool surface explicitly rejects force=True; slash command only
         out = _result(_TOOLS._handle_remove({"plugin": "fp", "force": True}))
         assert out["error"] == "invalid_arg"
         assert "force" in out.get("message", "")
+
+    def test_force_false_is_tolerated(self, monkeypatch):
+        # Compliant dispatchers may serialize all schema-declared bool fields
+        # with explicit false defaults. force=False must NOT be rejected.
+        monkeypatch.setattr(
+            _TOOLS.state,
+            "remove_import",
+            lambda plugin, **kw: _STATE.RemoveResult(plugin=plugin, removed_skills=1),
+        )
+        out = _result(_TOOLS._handle_remove({"plugin": "fp", "force": False}))
+        assert out.get("error") != "invalid_arg"
+        assert out["plugin"] == "fp"
 
     def test_missing_plugin_returns_missing_arg_error(self):
         out = _result(_TOOLS._handle_remove({}))
@@ -225,6 +237,22 @@ class TestHandleRemove:
         )
         out = _result(_TOOLS._handle_remove({"plugin": "never-installed"}))
         assert out["no_changes"] is True
+        # No restart notice on a no-op
+        assert "available_now" not in out
+        assert "notice" not in out
+
+    def test_dry_run_does_not_emit_restart_notice(self, monkeypatch):
+        # dry_run made no disk changes — telling the agent to "restart Hermes"
+        # would mislead it into a restart cycle for nothing.
+        monkeypatch.setattr(
+            _TOOLS.state,
+            "remove_import",
+            lambda plugin, **kw: _STATE.RemoveResult(plugin=plugin, dry_run=True, removed_skills=2),
+        )
+        out = _result(_TOOLS._handle_remove({"plugin": "fp", "dry_run": True}))
+        assert out["dry_run"] is True
+        assert "available_now" not in out
+        assert "notice" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +264,7 @@ class TestRedactPaths:
     """``_redact_paths(text)`` — strip absolute path-like substrings."""
 
     def test_replaces_single_path(self):
-        assert _TOOLS._redact_paths("/Users/tyler/.hermes/x: not found") == "<path>: not found"
+        assert _TOOLS._redact_paths("/home/someuser/.hermes/x: not found") == "<path>: not found"
 
     def test_replaces_multiple_paths(self):
         out = _TOOLS._redact_paths("a /foo/bar b /baz/qux")
@@ -247,6 +275,11 @@ class TestRedactPaths:
 
     def test_empty_string_returns_empty(self):
         assert _TOOLS._redact_paths("") == ""
+
+    def test_digit_starting_path_components_redacted(self):
+        # /proc/PID, /tmp/<numeric-name>, version dirs, etc.
+        assert "1234" not in _TOOLS._redact_paths("error at /proc/1234/fd")
+        assert _TOOLS._redact_paths("/tmp/456-foo") == "<path>"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +330,21 @@ class TestToolsTuple:
         for _name, schema, _handler, _emoji in _TOOLS.TOOLS:
             for token in forbidden:
                 assert token not in schema["description"]
+
+    def test_schema_name_matches_tuple_name(self):
+        # Drift between TOOLS[i][0] and TOOLS[i][1]["name"] would silently
+        # break dispatch — tools register under TOOLS[i][0], but agents see
+        # the schema's "name" field and dispatch against it.
+        for name, schema, _handler, _emoji in _TOOLS.TOOLS:
+            assert schema["name"] == name, (
+                f"Tuple name {name!r} disagrees with schema name {schema['name']!r}"
+            )
+
+    def test_schemas_reject_additional_properties(self):
+        # Strict schemas catch typos at the agent/dispatcher boundary instead
+        # of silently dropping unknown fields inside the handler.
+        for _name, schema, _handler, _emoji in _TOOLS.TOOLS:
+            assert schema["parameters"].get("additionalProperties") is False
 
 
 class TestPluginYamlDriftGuard:
