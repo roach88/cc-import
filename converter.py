@@ -236,15 +236,18 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
         cloned (anything inside is discarded — the clone workspace is owned
         by the caller and should not contain user data)
     """
+    env = _safe_clone_env()
     if dest.exists() and (dest / ".git").exists():
         logger.info("Updating plugin repo at %s", dest)
         subprocess.run(
             ["git", "-C", str(dest), "fetch", "--depth=1", "origin", branch],
             check=True,
+            env=env,
         )
         subprocess.run(
             ["git", "-C", str(dest), "reset", "--hard", f"origin/{branch}"],
             check=True,
+            env=env,
         )
         return
     if dest.exists():
@@ -253,8 +256,20 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
     logger.info("Cloning %s@%s → %s", url, branch, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", "--depth=1", "--branch", branch, url, str(dest)],
+        [
+            "git",
+            "clone",
+            "--depth=1",
+            "--branch",
+            branch,
+            "--no-recurse-submodules",
+            "--config",
+            "core.hooksPath=/dev/null",
+            url,
+            str(dest),
+        ],
         check=True,
+        env=env,
     )
 
 
