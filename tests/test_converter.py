@@ -1373,31 +1373,69 @@ class TestCloneOrUpdateHardening:
 
 
 class TestSaveManifestAtomic:
-    """``save_manifest`` writes via ``.tmp`` + ``os.replace`` for atomicity.
+    """``save_manifest`` writes via ``.tmp.<uuid>`` + ``os.replace`` for atomicity.
 
     Slice 1's :class:`TestManifestIO` covers the round-trip + create-parents
-    behavior. This class adds the atomic-rename guarantees from slice 2 R6.
+    behavior. This class adds the atomic-rename guarantees and the
+    concurrent-saver collision protection from slice 2 R6 (P2 #5).
     """
 
-    def test_writes_atomically_via_temp_file(self, tmp_path):
+    def test_writes_atomically_with_no_leftover_tmp(self, tmp_path):
         path = tmp_path / "state.json"
-        # Pre-existing valid manifest
         _CONVERTER.save_manifest(path, {"x": {"plugin": "y"}})
         assert path.exists()
-        # No leftover .tmp file after success
-        assert not (tmp_path / "state.json.tmp").exists()
+        # No leftover .tmp.<uuid> after success
+        leftovers = list(tmp_path.glob("state.json.tmp.*"))
+        assert leftovers == []
 
-    def test_overwrites_stale_tmp_from_prior_crash(self, tmp_path):
+    def test_uses_unique_tmp_filename_per_call(self, tmp_path, monkeypatch):
+        # Two saves should hit different tmp filenames so concurrent savers
+        # from different agent turns don't collide on os.replace.
+        captured: list[Path] = []
+        real_write_text = Path.write_text
+
+        def spy(self_path, *args, **kwargs):
+            if ".tmp." in self_path.name:
+                captured.append(self_path)
+            return real_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", spy)
         path = tmp_path / "state.json"
-        stale_tmp = tmp_path / "state.json.tmp"
-        # Simulate a crash mid-write: stale .tmp from a prior run
-        stale_tmp.write_text("garbage from interrupted save")
-        # New save should overwrite the stale .tmp and produce a valid final file
-        _CONVERTER.save_manifest(path, {"k": {"plugin": "p"}})
-        loaded = _CONVERTER.load_manifest(path)
-        assert loaded == {"k": {"plugin": "p"}}
-        # .tmp is consumed by the rename, not left behind
-        assert not stale_tmp.exists()
+        _CONVERTER.save_manifest(path, {"a": {"plugin": "p"}})
+        _CONVERTER.save_manifest(path, {"b": {"plugin": "p"}})
+        assert len(captured) == 2
+        assert captured[0] != captured[1]
+        for tmp in captured:
+            assert tmp.name.startswith("state.json.tmp.")
+
+    def test_partial_write_failure_cleans_up_tmp(self, tmp_path, monkeypatch):
+        path = tmp_path / "state.json"
+        # Pre-existing valid manifest
+        _CONVERTER.save_manifest(path, {"original": {"plugin": "p"}})
+        original_content = path.read_text()
+
+        # Simulate disk-full / OSError mid-write. The cleanup logic must
+        # remove the partial .tmp so retries don't leave orphans.
+        real_write_text = Path.write_text
+
+        def boom_on_tmp(self_path, *args, **kwargs):
+            if ".tmp." in self_path.name:
+                # Touch the file first so the cleanup branch has something
+                # to unlink (simulates a partial write that did create the
+                # file before the disk filled up).
+                real_write_text(self_path, "")
+                raise OSError("disk full")
+            return real_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", boom_on_tmp)
+        with pytest.raises(OSError, match="disk full"):
+            _CONVERTER.save_manifest(path, {"new": {"plugin": "p"}})
+
+        # Canonical state.json untouched
+        assert path.read_text() == original_content
+        # No orphan .tmp.* left behind
+        leftovers = list(tmp_path.glob("state.json.tmp.*"))
+        assert leftovers == []
 
 
 class TestImportPluginSchemaV2:

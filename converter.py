@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -212,21 +213,34 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write *manifest* to *path* atomically via ``.tmp`` + ``os.replace``.
+    """Write *manifest* to *path* atomically via ``.tmp.<uuid>`` + ``os.replace``.
 
     Creates parent directories if missing. Output uses ``indent=2`` and
     ``sort_keys=True`` so successive saves produce stable diffs.
 
-    Atomic-rename mitigates torn writes under concurrent invocations
-    (slice 2 R6). It does not serialize concurrent callers — single-
-    threaded use remains the documented assumption — but a process
-    killed mid-write leaves either the prior valid file or no file at
-    all, never a half-written one.
+    Atomic-rename mitigates torn writes (R6). The tmp filename includes
+    a per-call uuid so two concurrent savers — different agent turns,
+    different processes — write to different tmp files and never
+    collide on ``os.replace``. Single-threaded use is still the
+    documented assumption (last-writer-wins on the final state.json),
+    but this hardens the failure mode from ``FileNotFoundError`` to
+    benign data loss.
+
+    On write failure (disk full, permission error), the partial tmp
+    file is cleaned up so retries don't leave orphans.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    tmp = path.with_suffix(f"{path.suffix}.tmp.{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 # ---------------------------------------------------------------------------
