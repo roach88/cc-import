@@ -1200,3 +1200,21 @@ class TestValidateSubdir:
     def test_traversal_raises(self, tmp_path, subdir):
         with pytest.raises(ValueError, match=r"(?i)subdir|escape|outside"):
             _CONVERTER._validate_subdir(subdir, tmp_path)
+
+
+class TestSafeCloneEnv:
+    """``_safe_clone_env()`` — hardened env for git clone (R10, CVE-2017-1000117)."""
+
+    def test_includes_no_system_config(self):
+        env = _CONVERTER._safe_clone_env()
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+    def test_disables_global_config(self):
+        env = _CONVERTER._safe_clone_env()
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+
+    def test_inherits_path(self, monkeypatch):
+        # PATH must propagate so subprocess can find git
+        monkeypatch.setenv("PATH", "/custom/bin:/usr/bin")
+        env = _CONVERTER._safe_clone_env()
+        assert env["PATH"] == "/custom/bin:/usr/bin"
