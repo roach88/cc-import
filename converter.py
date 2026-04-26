@@ -495,7 +495,12 @@ def _skill_has_user_changes(dest_dir: Path, entry: dict[str, Any]) -> bool:
     try:
         src_files = {p.relative_to(src_dir): p for p in src_dir.rglob("*") if p.is_file()}
     except OSError:
-        return False
+        # Conservative: src exists but is unreadable (perms change, broken
+        # symlink, NFS failure). We can't prove the dest is unmodified,
+        # so preserve the dir rather than risk shutil.rmtree destroying
+        # user-added auxiliary files. Symmetric with the dest-OSError
+        # branch below.
+        return True
     if not src_files:
         # Source has no files to compare — SKILL.md-only check above decided.
         return False

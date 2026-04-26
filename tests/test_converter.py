@@ -855,6 +855,43 @@ class TestPruneRemoved:
         assert "plug/still-here" in manifest
         assert dest.exists()
 
+    def test_skill_has_user_changes_src_oserror_is_conservative(self, tmp_path, monkeypatch):
+        """Greptile P1: src rglob OSError must return True (preserve dir).
+
+        The function's docstring contract is "Conservative on I/O errors —
+        returns True so the dir is preserved." The dest rglob branch
+        already does this; the src rglob branch used to return False and
+        let ``remove_import`` rmtree the dir, silently destroying any
+        user-added helper.py / config.yaml. Now both branches honor the
+        contract.
+        """
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "SKILL.md").write_text("upstream")
+
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        (dest_dir / "SKILL.md").write_text("upstream")  # matches origin_hash
+
+        entry = {
+            "origin_hash": _CONVERTER.sha256_file(dest_dir / "SKILL.md"),
+            "source_path": str(src_dir),
+        }
+
+        # Selectively raise OSError on the src enumeration; let the dest
+        # rglob succeed normally so we exercise exactly the branch the
+        # docstring covers.
+        original_rglob = Path.rglob
+
+        def selective_rglob(self, pattern):
+            if str(self) == str(src_dir):
+                raise OSError("simulated unreadable source clone")
+            return original_rglob(self, pattern)
+
+        monkeypatch.setattr(Path, "rglob", selective_rglob)
+
+        assert _CONVERTER._skill_has_user_changes(dest_dir, entry) is True
+
     def test_user_added_aux_file_preserved_when_upstream_removed(self, tmp_path, caplog):
         """Greptile P1: prune_removed must use the whole-tree check.
 
