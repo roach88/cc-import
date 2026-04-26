@@ -50,14 +50,10 @@ class TestHandleInstall:
             captured["git_url"] = git_url
             captured["branch"] = kwargs.get("branch")
             captured["subdir"] = kwargs.get("subdir")
-            return _CONVERTER.ImportSummary(
-                plugin="myplug", skills_imported=2, agents_translated=1
-            )
+            return _CONVERTER.ImportSummary(plugin="myplug", skills_imported=2, agents_translated=1)
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
-        out = _result(
-            _TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"})
-        )
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
         assert out["plugin"] == "myplug"
         assert out["skills_imported"] == 2
         assert out["agents_translated"] == 1
@@ -96,9 +92,7 @@ class TestHandleInstall:
         assert out["error"] == "missing_arg"
 
     def test_disallowed_host_returns_disallowed_host_error(self):
-        out = _result(
-            _TOOLS._handle_install({"git_url": "https://evil.com/payload.git"})
-        )
+        out = _result(_TOOLS._handle_install({"git_url": "https://evil.com/payload.git"}))
         assert out["error"] == "disallowed_host"
 
     def test_non_https_scheme_returns_invalid_arg_error(self):
@@ -110,37 +104,27 @@ class TestHandleInstall:
             raise subprocess.CalledProcessError(returncode=128, cmd=["git", "clone"])
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
-        out = _result(
-            _TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"})
-        )
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
         assert out["error"] == "clone_failed"
         assert "128" in out.get("message", "")
 
-    def test_validator_value_error_from_import_plugin_returns_invalid_arg(
-        self, monkeypatch
-    ):
+    def test_validator_value_error_from_import_plugin_returns_invalid_arg(self, monkeypatch):
         # _validate_plugin_name / _validate_subdir raise ValueError inside import_plugin
         def fake_import(*_a, **_kw):
             raise ValueError("plugin_name '../core' contains disallowed characters")
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
-        out = _result(
-            _TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"})
-        )
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
         assert out["error"] == "invalid_arg"
 
-    def test_generic_exception_becomes_internal_error_with_redacted_path(
-        self, monkeypatch
-    ):
+    def test_generic_exception_becomes_internal_error_with_redacted_path(self, monkeypatch):
         def fake_import(*_a, **_kw):
             raise RuntimeError(
                 "FileNotFoundError: [Errno 2] No such file: '/Users/tyler/.hermes/x'"
             )
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
-        out = _result(
-            _TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"})
-        )
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
         assert out["error"] == "internal_error"
         msg = out.get("message", "")
         assert "/Users/tyler" not in msg
@@ -252,8 +236,7 @@ class TestRedactPaths:
     """``_redact_paths(text)`` — strip absolute path-like substrings."""
 
     def test_replaces_single_path(self):
-        assert _TOOLS._redact_paths("/Users/tyler/.hermes/x: not found") == \
-            "<path>: not found"
+        assert _TOOLS._redact_paths("/Users/tyler/.hermes/x: not found") == "<path>: not found"
 
     def test_replaces_multiple_paths(self):
         out = _TOOLS._redact_paths("a /foo/bar b /baz/qux")
@@ -314,3 +297,21 @@ class TestToolsTuple:
         for _name, schema, _handler, _emoji in _TOOLS.TOOLS:
             for token in forbidden:
                 assert token not in schema["description"]
+
+
+class TestPluginYamlDriftGuard:
+    """``plugin.yaml`` ``provides_tools`` must stay in sync with ``tools.TOOLS``.
+
+    The yaml block is documentation-only at runtime, but a mismatch
+    between yaml and code is a footgun (the yaml is what humans read in
+    PR descriptions and ``hermes plugins list``).
+    """
+
+    def test_provides_tools_matches_tools_TOOLS(self):
+        import yaml as _yaml
+
+        repo_root = Path(__file__).resolve().parents[1]
+        manifest = _yaml.safe_load((repo_root / "plugin.yaml").read_text())
+        yaml_tools = manifest.get("provides_tools", [])
+        code_tools = [t[0] for t in _TOOLS.TOOLS]
+        assert yaml_tools == code_tools

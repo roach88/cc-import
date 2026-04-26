@@ -68,6 +68,14 @@ include = ["**"]
 
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
+# Slice 2 adds a third-tier fallback (`module = None` when both relative
+# and absolute imports fail under pytest's eager Package.setup()). The
+# fallback is harmless at runtime — register() / handlers are never
+# invoked in that context — but ty flags the union with None as
+# unsafe attribute access. Suppressed with the same rationale as
+# unresolved-import: the runtime resolution is correct.
+unresolved-attribute = "ignore"
+conflicting-declarations = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

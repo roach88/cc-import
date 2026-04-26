@@ -1,4 +1,11 @@
 name: cc-import
-version: 0.1.0
-description: "Import Claude Code plugins (skills + agents) into Hermes Agent. Translates Claude Code agent personas into Hermes delegation skills, copies skill bundles into the user's skills/ tree."
+version: 0.2.0
+description: "Import Claude Code plugins (skills + agents) into Hermes Agent. Translates Claude Code agent personas into Hermes delegation skills, copies skill bundles into the user's skills/ tree. Slash command and agent-callable tools."
 author: Tyler Barstow
+# Documentation-only declaration: the actual registration happens in
+# __init__.py via ctx.register_tool. A drift-guard test in tests/test_tools.py
+# asserts this list stays in sync with tools.TOOLS.
+provides_tools:
+  - cc_import_install
+  - cc_import_list
+  - cc_import_remove
