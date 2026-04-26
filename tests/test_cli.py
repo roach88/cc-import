@@ -158,9 +158,11 @@ class TestListSubcommand:
         )
         result = _CLI.handle_command("list --json")
         parsed = _json.loads(result)
-        assert isinstance(parsed, list)
-        assert parsed[0]["name"] == "fp"
-        assert parsed[0]["skills_count"] == 2
+        # Slash --json wraps in {plugins: [...]} to match cc_import_list tool
+        # envelope so a single agent harness can parse either surface uniformly.
+        assert "plugins" in parsed
+        assert parsed["plugins"][0]["name"] == "fp"
+        assert parsed["plugins"][0]["skills_count"] == 2
 
     def test_empty_list_text_output(self, monkeypatch):
         monkeypatch.setattr(_STATE, "list_imports", lambda **_kw: [])
@@ -172,7 +174,7 @@ class TestListSubcommand:
 
         monkeypatch.setattr(_STATE, "list_imports", lambda **_kw: [])
         result = _CLI.handle_command("list --json")
-        assert _json.loads(result) == []
+        assert _json.loads(result) == {"plugins": []}
 
     def test_backend_exception_returns_error_string(self, monkeypatch):
         def boom(**_kw):

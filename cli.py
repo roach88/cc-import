@@ -122,7 +122,9 @@ def _cmd_list(argv: list[str]) -> str:
         return _redact_paths(f"Error: list failed: {exc}")
 
     if ns.json:
-        return json.dumps([asdict(e) for e in entries], indent=2)
+        # Wrap in {plugins: [...]} to match the cc_import_list tool envelope
+        # so a single agent harness can parse either surface uniformly.
+        return json.dumps({"plugins": [asdict(e) for e in entries]}, indent=2)
     return _format_list_text(entries)
 
 

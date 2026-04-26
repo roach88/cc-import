@@ -131,8 +131,12 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
             # plugin_name / subdir traversal.
             return tool_error("invalid_arg", _redact_paths(str(exc)))
 
+        # Envelope: {result: <ImportSummary>, available_now, available_after,
+        # notice}. Operations (install, remove) wrap the dataclass under
+        # `result` and surface availability metadata as siblings; queries
+        # (list) use a typed-name key like `plugins`. See _handle_list.
         payload: dict[str, Any] = {
-            **asdict(summary),
+            "result": asdict(summary),
             "available_now": False,
             "available_after": "next_session",
             "notice": _NEXT_SESSION_NOTICE,
@@ -176,11 +180,11 @@ def _handle_remove(args: dict[str, Any], **_kwargs: Any) -> str:
         dry_run = bool(args.get("dry_run", False))
 
         result = state.remove_import(plugin, force=False, dry_run=dry_run)
-        payload: dict[str, Any] = asdict(result)
-        # Deferred-state contract: only attach the "restart Hermes" notice
-        # when an actual change happened. dry_run and no_changes paths
-        # don't change disk state, so the restart instruction would
-        # mislead the agent.
+        # Same envelope as install: {result: <RemoveResult>, [available_now,
+        # available_after, notice]}. Availability fields are present only
+        # when an actual change happened — dry_run and no_changes paths
+        # leave them off so the agent isn't told to restart for nothing.
+        payload: dict[str, Any] = {"result": asdict(result)}
         if not dry_run and not result.no_changes:
             payload["available_now"] = False
             payload["available_after"] = "next_session"

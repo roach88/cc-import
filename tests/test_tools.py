@@ -54,9 +54,10 @@ class TestHandleInstall:
 
         monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
         out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
-        assert out["plugin"] == "myplug"
-        assert out["skills_imported"] == 2
-        assert out["agents_translated"] == 1
+        # Envelope: {result: {...}, available_now, available_after, notice}
+        assert out["result"]["plugin"] == "myplug"
+        assert out["result"]["skills_imported"] == 2
+        assert out["result"]["agents_translated"] == 1
         assert out["available_now"] is False
         assert out["available_after"] == "next_session"
         assert "notice" in out
@@ -203,8 +204,9 @@ class TestHandleRemove:
 
         monkeypatch.setattr(_TOOLS.state, "remove_import", fake_remove)
         out = _result(_TOOLS._handle_remove({"plugin": "fp"}))
-        assert out["plugin"] == "fp"
-        assert out["removed_skills"] == 2
+        # Envelope: {result: {...}, available_now, available_after, notice}
+        assert out["result"]["plugin"] == "fp"
+        assert out["result"]["removed_skills"] == 2
         assert out["available_now"] is False
         assert out["available_after"] == "next_session"
 
@@ -237,7 +239,7 @@ class TestHandleRemove:
         )
         out = _result(_TOOLS._handle_remove({"plugin": "fp", "force": False}))
         assert out.get("error") != "invalid_arg"
-        assert out["plugin"] == "fp"
+        assert out["result"]["plugin"] == "fp"
 
     def test_missing_plugin_returns_missing_arg_error(self):
         out = _result(_TOOLS._handle_remove({}))
@@ -250,7 +252,7 @@ class TestHandleRemove:
             lambda plugin, **kw: _STATE.RemoveResult(plugin=plugin, no_changes=True),
         )
         out = _result(_TOOLS._handle_remove({"plugin": "never-installed"}))
-        assert out["no_changes"] is True
+        assert out["result"]["no_changes"] is True
         # No restart notice on a no-op
         assert "available_now" not in out
         assert "notice" not in out
@@ -264,7 +266,7 @@ class TestHandleRemove:
             lambda plugin, **kw: _STATE.RemoveResult(plugin=plugin, dry_run=True, removed_skills=2),
         )
         out = _result(_TOOLS._handle_remove({"plugin": "fp", "dry_run": True}))
-        assert out["dry_run"] is True
+        assert out["result"]["dry_run"] is True
         assert "available_now" not in out
         assert "notice" not in out
 
