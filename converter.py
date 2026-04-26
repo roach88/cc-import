@@ -433,6 +433,48 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Hostnames an agent-callable installer is allowed to clone from. Slice 2
+# hardcodes the most common public Git hosts. Slice 3 may surface a config
+# override; for now slash-command users bypass this check entirely.
+_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"}
+)
+
+
+def _validate_url(url: str) -> None:
+    """Validate *url* for agent-callable use (R10). Raises ``ValueError`` on rejection.
+
+    Three layered checks:
+      1. URL must be a non-empty HTTPS string. Anything else (file://,
+         git://, ssh://, scp-style ``git@host:org/repo``, plain http://)
+         raises with a "https" or "scheme" hint.
+      2. URL must parse to a hostname. Empty or unparseable values raise.
+      3. Hostname must be on :data:`_ALLOWED_HOSTS`. Anything else raises
+         with an "allowlist" hint so tool handlers can surface
+         ``tool_error("disallowed_host", ...)``.
+
+    Slash command callers do **not** invoke this — they're considered
+    human-vetted. Tool handlers in :mod:`tools` do.
+    """
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("git_url is required and must be a non-empty string")
+    if not url.startswith("https://"):
+        raise ValueError(
+            "git_url must use https scheme; got " + url.split("://", 1)[0] + "://"
+        )
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("git_url has no parseable hostname")
+    if host not in _ALLOWED_HOSTS:
+        raise ValueError(
+            f"git_url host {host!r} is not on the allowlist "
+            f"({', '.join(sorted(_ALLOWED_HOSTS))})"
+        )
+
+
 def _resolve_hermes_home(hermes_home: Path | None) -> Path:
     if hermes_home is not None:
         return hermes_home
