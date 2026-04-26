@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -420,6 +421,16 @@ class ImportSummary:
     agents_translated: int = 0
     agents_unchanged: int = 0
     skipped_user_modified: list[str] = field(default_factory=list)
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 ``...Z`` string.
+
+    Used for ``imported_at`` on manifest entries. Format is fixed at
+    seconds precision with a trailing ``Z`` so successive saves produce
+    stable, sortable, jq-friendly timestamps.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _resolve_hermes_home(hermes_home: Path | None) -> Path:
