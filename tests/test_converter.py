@@ -1071,3 +1071,62 @@ class TestNowIso:
         ts = _CONVERTER._now_iso()
         parsed = datetime.fromisoformat(ts.rstrip("Z"))
         assert parsed.year >= 2026
+
+
+class TestValidateUrl:
+    """``_validate_url(url)`` — agent-callable installer hardening (R10).
+
+    Allowlist hosts: github.com, gitlab.com, bitbucket.org, codeberg.org.
+    HTTPS only. Rejects file://, git://, ssh://. Raises ``ValueError`` on
+    rejection so tool handlers can convert to a ``tool_error`` with a
+    domain-specific code.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/Foo/Bar.git",
+            "https://gitlab.com/Foo/Bar.git",
+            "https://bitbucket.org/Foo/Bar.git",
+            "https://codeberg.org/Foo/Bar.git",
+            "https://github.com/Foo/Bar",  # no .git suffix
+        ],
+    )
+    def test_allowlisted_hosts_pass(self, url):
+        # No exception
+        _CONVERTER._validate_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.com/payload.git",
+            "https://github.io/Foo/Bar",  # github.io is not github.com
+            "https://raw.githubusercontent.com/Foo/Bar",
+            "https://192.168.1.1/repo.git",
+        ],
+    )
+    def test_disallowed_hosts_raise(self, url):
+        with pytest.raises(ValueError, match=r"(?i)host|allowlist"):
+            _CONVERTER._validate_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///tmp/local-repo",
+            "git://github.com/Foo/Bar.git",
+            "ssh://git@github.com/Foo/Bar.git",
+            "git@github.com:Foo/Bar.git",  # SCP-style SSH
+            "http://github.com/Foo/Bar.git",  # plain HTTP
+        ],
+    )
+    def test_non_https_schemes_raise(self, url):
+        with pytest.raises(ValueError, match=r"(?i)https|scheme"):
+            _CONVERTER._validate_url(url)
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_url("")
+
+    def test_garbage_string_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_url("not a url at all")
