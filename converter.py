@@ -475,6 +475,28 @@ def _validate_url(url: str) -> None:
         )
 
 
+_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_plugin_name(name: str) -> None:
+    """Reject plugin names that could escape ``$HERMES_HOME/skills/`` (R11).
+
+    The name is used as a directory under ``skills/``, so any path-special
+    character would let a malicious ``plugin.json`` write outside the
+    intended subtree. We require ASCII letters/digits/dot/dash/underscore
+    and reject the literal ``..`` traversal token.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("plugin_name is required and must be a non-empty string")
+    if name == "..":
+        raise ValueError("plugin_name cannot be '..'")
+    if not _PLUGIN_NAME_RE.match(name):
+        raise ValueError(
+            f"plugin_name {name!r} contains disallowed characters "
+            f"(only [A-Za-z0-9._-] permitted)"
+        )
+
+
 def _resolve_hermes_home(hermes_home: Path | None) -> Path:
     if hermes_home is not None:
         return hermes_home
