@@ -417,6 +417,115 @@ class TestRemoveImport:
         assert result.clone_cache_status == "skipped_unfindable"
         assert not (hermes / "skills" / "fp").exists()
 
+    def test_user_added_helper_file_preserved_by_default(self, tmp_path):
+        # Slice 1's SKILL.md-only check would silently destroy this helper.py
+        # via the rmtree on the parent dir. Slice 2 must catch it.
+        hermes = tmp_path / ".hermes"
+        body = "skill body"
+        md = _seed_skill_file(hermes, "fp", "alpha", body)
+        helper = md.parent / "helper.py"
+        helper.write_text("# user-added")
+        # Source dir has only SKILL.md (no helper.py upstream)
+        src_dir = hermes / "plugins" / "cc-import" / "clones" / "fp-repo" / "skills" / "alpha"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text(body)
+        _seed_manifest(
+            hermes,
+            {
+                "fp/alpha": {
+                    "plugin": "fp",
+                    "kind": "skill",
+                    "source_path": str(src_dir),
+                    "origin_hash": _hash(body),
+                },
+            },
+        )
+        result = _STATE.remove_import("fp", hermes_home=hermes)
+        assert "fp/alpha" in result.kept_user_modified
+        assert helper.exists()
+        assert md.exists()
+
+    def test_legit_multi_file_upstream_skill_removed_cleanly(self, tmp_path):
+        # When a legitimate multi-file upstream skill matches dest exactly,
+        # nothing should be flagged as user-modified.
+        hermes = tmp_path / ".hermes"
+        body = "skill body"
+        helper_body = "# upstream helper"
+        md = _seed_skill_file(hermes, "fp", "alpha", body)
+        (md.parent / "helper.py").write_text(helper_body)
+        src_dir = hermes / "plugins" / "cc-import" / "clones" / "fp-repo" / "skills" / "alpha"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text(body)
+        (src_dir / "helper.py").write_text(helper_body)  # matches dest
+        _seed_manifest(
+            hermes,
+            {
+                "fp/alpha": {
+                    "plugin": "fp",
+                    "kind": "skill",
+                    "source_path": str(src_dir),
+                    "origin_hash": _hash(body),
+                },
+            },
+        )
+        result = _STATE.remove_import("fp", hermes_home=hermes)
+        assert result.kept_user_modified == []
+        assert result.removed_skills == 1
+        assert not (hermes / "skills" / "fp").exists()
+
+    def test_modified_helper_file_preserves_dir(self, tmp_path):
+        # Upstream ships SKILL.md + helper.py; user edits helper.py.
+        # SKILL.md is unmodified, but the dir as a whole has user changes.
+        hermes = tmp_path / ".hermes"
+        body = "skill body"
+        md = _seed_skill_file(hermes, "fp", "alpha", body)
+        helper = md.parent / "helper.py"
+        helper.write_text("# user-edited helper")
+        src_dir = hermes / "plugins" / "cc-import" / "clones" / "fp-repo" / "skills" / "alpha"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text(body)
+        (src_dir / "helper.py").write_text("# upstream helper")  # different
+        _seed_manifest(
+            hermes,
+            {
+                "fp/alpha": {
+                    "plugin": "fp",
+                    "kind": "skill",
+                    "source_path": str(src_dir),
+                    "origin_hash": _hash(body),
+                },
+            },
+        )
+        result = _STATE.remove_import("fp", hermes_home=hermes)
+        assert "fp/alpha" in result.kept_user_modified
+        assert helper.exists()
+        assert helper.read_text() == "# user-edited helper"
+
+    def test_force_overrides_user_added_files(self, tmp_path):
+        hermes = tmp_path / ".hermes"
+        body = "skill body"
+        md = _seed_skill_file(hermes, "fp", "alpha", body)
+        helper = md.parent / "helper.py"
+        helper.write_text("# user-added")
+        src_dir = hermes / "plugins" / "cc-import" / "clones" / "fp-repo" / "skills" / "alpha"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text(body)
+        _seed_manifest(
+            hermes,
+            {
+                "fp/alpha": {
+                    "plugin": "fp",
+                    "kind": "skill",
+                    "source_path": str(src_dir),
+                    "origin_hash": _hash(body),
+                },
+            },
+        )
+        result = _STATE.remove_import("fp", force=True, hermes_home=hermes)
+        assert result.kept_user_modified == []
+        assert not helper.exists()
+        assert not md.exists()
+
     def test_skill_dir_already_missing_no_error(self, tmp_path):
         hermes = tmp_path / ".hermes"
         body = "alpha"
