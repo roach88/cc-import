@@ -27,6 +27,27 @@ logger = logging.getLogger(__name__)
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 
+
+# Match absolute path-like substrings. Each component starts with at least
+# one path-allowed char (alnum, dot, dash, underscore) so digit-starting
+# components like /proc/1234 / /tmp/456-foo are also redacted. Shared by
+# the slash surface (:mod:`cli`) and the agent tool surface (:mod:`tools`)
+# so error messages don't leak filesystem layout.
+_PATH_RE = re.compile(r"/[\w.][\w./-]*")
+
+
+def _redact_paths(text: str) -> str:
+    """Replace absolute path-like substrings with ``<path>``.
+
+    Exception messages routinely embed filesystem paths
+    (``FileNotFoundError: ...: '/Users/.../state.json'``); leaking those
+    in ``tool_error`` output (or in slash output that may also reach an
+    agent via gateway sessions / transcript replay) lets a prompt-injected
+    agent map the local layout.
+    """
+    return _PATH_RE.sub("<path>", text or "")
+
+
 # Claude Code tool name → Hermes toolset. Covers the common CC tools;
 # unknowns are reported, not dropped. Extend as upstream plugins reveal new
 # tools. Ports verbatim from plugin_sync.py.
@@ -437,6 +458,67 @@ def migrate_agent(
     return "TRANSLATE"
 
 
+def _skill_has_user_changes(dest_dir: Path, entry: dict[str, Any]) -> bool:
+    """Detect user changes inside ``dest_dir`` relative to its source clone.
+
+    Slice 1 only compared ``SKILL.md`` hashes — that misses user-added
+    auxiliary files (``helper.py``, ``config.yaml``) and files the user
+    edited beyond SKILL.md. Slice 2 extends the check to a whole-tree
+    compare against the manifest entry's ``source_path``:
+
+    1. SKILL.md hash differs from ``origin_hash`` → user-modified.
+    2. Any file in ``dest_dir`` not present in ``source_path`` → user-added.
+    3. Any file in both with differing hash → user-modified.
+
+    Falls back to the slice-1 SKILL.md-only result when the source clone
+    is missing or empty (clone cache already pruned, or test fixture
+    didn't seed source files). Conservative on I/O errors — returns
+    True so the dir is preserved.
+    """
+    origin_hash = entry.get("origin_hash")
+    dest_md = dest_dir / "SKILL.md"
+
+    if dest_md.exists() and origin_hash:
+        try:
+            if sha256_file(dest_md) != origin_hash:
+                return True
+        except OSError:
+            return True
+
+    source_path = entry.get("source_path")
+    if not isinstance(source_path, str) or not source_path:
+        return False
+    src_dir = Path(source_path)
+    if not src_dir.exists():
+        return False
+
+    try:
+        src_files = {p.relative_to(src_dir): p for p in src_dir.rglob("*") if p.is_file()}
+    except OSError:
+        return False
+    if not src_files:
+        # Source has no files to compare — SKILL.md-only check above decided.
+        return False
+
+    try:
+        dest_files = {p.relative_to(dest_dir): p for p in dest_dir.rglob("*") if p.is_file()}
+    except OSError:
+        return True
+
+    # User-added: any file in dest not in src
+    if any(rel not in src_files for rel in dest_files):
+        return True
+    # User-modified: hash differs for any file in both. Files only in src
+    # (deleted by user) don't count — we're about to remove the dir anyway.
+    for rel, dest_file in dest_files.items():
+        try:
+            if sha256_file(dest_file) != sha256_file(src_files[rel]):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def prune_removed(
     plugin: str,
     seen_keys: set[str],
@@ -447,22 +529,23 @@ def prune_removed(
 
     Iterates manifest entries scoped to ``plugin`` that were *not* observed
     during this sync (i.e., not in ``seen_keys``). For each such stale
-    entry: if the on-disk file is unmodified relative to the recorded
-    ``origin_hash``, delete it and pop the manifest entry; otherwise log a
-    KEEP warning and retain both file and manifest entry. If the file has
-    already been deleted out from under us, the manifest entry is popped
-    cleanly.
+    entry: if the on-disk tree is unmodified relative to the recorded
+    source (whole-tree check via :func:`_skill_has_user_changes` —
+    SKILL.md hash plus user-added auxiliary files like ``helper.py`` /
+    ``config.yaml``), delete it and pop the manifest entry; otherwise log
+    a KEEP warning and retain both file and manifest entry. If the file
+    has already been deleted out from under us, the manifest entry is
+    popped cleanly.
     """
     stale = [k for k, v in manifest.items() if v.get("plugin") == plugin and k not in seen_keys]
     for key in stale:
         entry = manifest[key]
-        dest_md = skills_dir / key / "SKILL.md"
+        dest_dir = skills_dir / key
+        dest_md = dest_dir / "SKILL.md"
         if dest_md.exists():
-            local_hash = sha256_file(dest_md)
-            if local_hash != entry["origin_hash"]:
+            if _skill_has_user_changes(dest_dir, entry):
                 logger.warning("KEEP (user-modified, upstream removed): %s", key)
                 continue
-            dest_dir = skills_dir / key
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
             logger.info("REMOVE (upstream deleted): %s", key)

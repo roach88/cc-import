@@ -127,65 +127,11 @@ class RemoveResult:
     no_changes: bool = False
 
 
-def _skill_has_user_changes(dest_dir: Path, entry: dict[str, Any]) -> bool:
-    """Detect user changes inside ``dest_dir`` relative to its source clone.
-
-    Slice 1 only compared ``SKILL.md`` hashes — that misses user-added
-    auxiliary files (``helper.py``, ``config.yaml``) and files the user
-    edited beyond SKILL.md. Slice 2 extends the check to a whole-tree
-    compare against the manifest entry's ``source_path``:
-
-    1. SKILL.md hash differs from ``origin_hash`` → user-modified.
-    2. Any file in ``dest_dir`` not present in ``source_path`` → user-added.
-    3. Any file in both with differing hash → user-modified.
-
-    Falls back to the slice-1 SKILL.md-only result when the source clone
-    is missing or empty (clone cache already pruned, or test fixture
-    didn't seed source files). Conservative on I/O errors — returns
-    True so the dir is preserved.
-    """
-    origin_hash = entry.get("origin_hash")
-    dest_md = dest_dir / "SKILL.md"
-
-    if dest_md.exists() and origin_hash:
-        try:
-            if converter.sha256_file(dest_md) != origin_hash:
-                return True
-        except OSError:
-            return True
-
-    source_path = entry.get("source_path")
-    if not isinstance(source_path, str) or not source_path:
-        return False
-    src_dir = Path(source_path)
-    if not src_dir.exists():
-        return False
-
-    try:
-        src_files = {p.relative_to(src_dir): p for p in src_dir.rglob("*") if p.is_file()}
-    except OSError:
-        return False
-    if not src_files:
-        # Source has no files to compare — SKILL.md-only check above decided.
-        return False
-
-    try:
-        dest_files = {p.relative_to(dest_dir): p for p in dest_dir.rglob("*") if p.is_file()}
-    except OSError:
-        return True
-
-    # User-added: any file in dest not in src
-    if any(rel not in src_files for rel in dest_files):
-        return True
-    # User-modified: hash differs for any file in both. Files only in src
-    # (deleted by user) don't count — we're about to remove the dir anyway.
-    for rel, dest_file in dest_files.items():
-        try:
-            if converter.sha256_file(dest_file) != converter.sha256_file(src_files[rel]):
-                return True
-        except OSError:
-            return True
-    return False
+# Whole-tree user-modification detection lives in :mod:`converter` so both
+# ``remove_import`` (here) and ``converter.prune_removed`` use the same
+# logic — protecting user-added auxiliary files (``helper.py``,
+# ``config.yaml``) consistently across the import and remove paths.
+_skill_has_user_changes = converter._skill_has_user_changes
 
 
 def _find_clone_cache(

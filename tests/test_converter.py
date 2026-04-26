@@ -855,6 +855,43 @@ class TestPruneRemoved:
         assert "plug/still-here" in manifest
         assert dest.exists()
 
+    def test_user_added_aux_file_preserved_when_upstream_removed(self, tmp_path, caplog):
+        """Greptile P1: prune_removed must use the whole-tree check.
+
+        Slice 1 only compared SKILL.md hashes here, so a user-added
+        ``helper.py`` would be silently destroyed when upstream removed
+        the skill. ``_skill_has_user_changes`` extends the comparison
+        to the whole tree.
+        """
+        import logging
+
+        skills_dir = tmp_path / "skills"
+        src_dir = tmp_path / "src" / "stale"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text("upstream")
+
+        dest = skills_dir / "plug" / "stale"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("upstream")  # SKILL.md unmodified
+        (dest / "helper.py").write_text("# user-added auxiliary file")
+
+        manifest: dict = {
+            "plug/stale": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": str(src_dir),
+                "origin_hash": _CONVERTER.sha256_file(dest / "SKILL.md"),
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            _CONVERTER.prune_removed("plug", set(), manifest, skills_dir)
+
+        assert (dest / "helper.py").exists(), "user-added helper.py was destroyed"
+        assert (dest / "SKILL.md").exists()
+        assert "plug/stale" in manifest
+        assert any("KEEP" in rec.message for rec in caplog.records)
+
 
 @pytest.fixture
 def bare_cc_plugin(tmp_path, bare_upstream):

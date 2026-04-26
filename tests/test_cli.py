@@ -247,6 +247,40 @@ class TestRemoveSubcommand:
         result = _CLI.handle_command("remove fp --dry-run")
         assert "Would remove" in result or "would remove" in result.lower()
 
+    def test_dry_run_clone_cache_uses_future_tense(self, monkeypatch):
+        """Dry-run must not announce the clone cache as already deleted (Greptile P1)."""
+
+        def fake_remove(plugin, **kwargs):
+            return _STATE.RemoveResult(
+                plugin=plugin,
+                dry_run=True,
+                removed_skills=1,
+                clone_cache_status="removed",
+                clone_cache_path="/tmp/fp-repo",
+            )
+
+        monkeypatch.setattr(_STATE, "remove_import", fake_remove)
+        result = _CLI.handle_command("remove fp --dry-run")
+        assert "clone cache: would remove" in result
+        assert "clone cache: removed" not in result
+
+    def test_real_remove_clone_cache_uses_past_tense(self, monkeypatch):
+        """Non-dry-run still reports past tense once the deletion has actually run."""
+
+        def fake_remove(plugin, **kwargs):
+            return _STATE.RemoveResult(
+                plugin=plugin,
+                dry_run=False,
+                removed_skills=1,
+                clone_cache_status="removed",
+                clone_cache_path="/tmp/fp-repo",
+            )
+
+        monkeypatch.setattr(_STATE, "remove_import", fake_remove)
+        result = _CLI.handle_command("remove fp")
+        assert "clone cache: removed" in result
+        assert "would remove" not in result
+
     def test_missing_plugin_arg_returns_error(self):
         result = _CLI.handle_command("remove")
         assert "error" in result.lower() or "plugin" in result.lower()

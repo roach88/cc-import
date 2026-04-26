@@ -1,10 +1,10 @@
 """cc-import — Hermes plugin entry point.
 
-Slice 1 wires only the ``/cc-import`` slash command. Slice 2 will add
-agent-callable tools (``cc_import_install``, ``cc_import_list``,
-``cc_import_remove``) via :meth:`PluginContext.register_tool`. Slice 3
-will add an ``on_session_start`` hook that opportunistically re-syncs
-configured sources.
+Wires the ``/cc-import`` slash command and the agent-callable tools
+``cc_import_install`` / ``cc_import_list`` / ``cc_import_remove`` via
+:meth:`PluginContext.register_tool`. Slice 3 will add an
+``on_session_start`` hook that opportunistically re-syncs configured
+sources.
 
 Why a slash command instead of a top-level CLI subcommand: Hermes's
 ``register_cli_command`` stores registrations but does not yet wire them

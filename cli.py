@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shlex
 import subprocess
 from dataclasses import asdict
@@ -27,14 +26,12 @@ except ImportError:
     import state  # type: ignore[no-redef]
 
 
-# Slash-surface path redaction. The agent tool surface uses tools._redact_paths;
-# slash output may also reach an agent (gateway sessions, transcript replay),
-# so apply the same discipline before returning exception text.
-_PATH_RE = re.compile(r"/[\w.][\w./-]*")
-
-
-def _redact_paths(text: str) -> str:
-    return _PATH_RE.sub("<path>", text or "")
+# Path redaction is shared with :mod:`tools` via :mod:`converter`. Slash
+# output may reach an agent (gateway sessions, transcript replay), so the
+# same discipline applies before returning exception text. Re-binding the
+# canonical helper as a module attribute keeps the call sites in this
+# file unchanged.
+_redact_paths = converter._redact_paths
 
 
 _USAGE = (
@@ -196,8 +193,9 @@ def _format_remove(result: state.RemoveResult) -> str:
         for key in result.kept_user_modified:
             parts.append(f"  - {key}")
     status = result.clone_cache_status
+    cache_verb = "would remove" if result.dry_run else "removed"
     if status == "removed":
-        parts.append(f"  clone cache: removed ({result.clone_cache_path})")
+        parts.append(f"  clone cache: {cache_verb} ({result.clone_cache_path})")
     elif status == "already_missing":
         parts.append(f"  clone cache: already missing ({result.clone_cache_path})")
     elif status == "skipped_path_outside_anchor":

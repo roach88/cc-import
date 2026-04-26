@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 from dataclasses import asdict
 from typing import Any
@@ -61,20 +60,11 @@ except ImportError:  # pragma: no cover - production-import shape covered by smo
         return json.dumps(body)
 
 
-# Match absolute path-like substrings. Each component starts with at least
-# one path-allowed char (alnum, dot, dash, underscore) so digit-starting
-# components like /proc/1234 / /tmp/456-foo are also redacted.
-_PATH_RE = re.compile(r"/[\w.][\w./-]*")
-
-
-def _redact_paths(text: str) -> str:
-    """Replace absolute path-like substrings with ``<path>``.
-
-    Exception messages routinely embed filesystem paths
-    (``FileNotFoundError: ...: '/Users/.../state.json'``); leaking those
-    in ``tool_error`` lets a prompt-injected agent map the local layout.
-    """
-    return _PATH_RE.sub("<path>", text or "")
+# Path redaction is shared with the slash surface (:mod:`cli`) via the
+# canonical helper in :mod:`converter`. Re-binding as a module attribute
+# keeps the call sites in this file (and the ``_TOOLS._redact_paths``
+# test surface) unchanged.
+_redact_paths = converter._redact_paths
 
 
 _NEXT_SESSION_NOTICE = (
