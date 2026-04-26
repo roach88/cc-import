@@ -1309,3 +1309,77 @@ class TestSaveManifestAtomic:
         assert loaded == {"k": {"plugin": "p"}}
         # .tmp is consumed by the rename, not left behind
         assert not stale_tmp.exists()
+
+
+class TestImportPluginSchemaV2:
+    """``import_plugin`` populates ``_plugins`` install cache + validates inputs (R6, R11)."""
+
+    def test_fresh_import_populates_plugins_index(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        manifest = _CONVERTER.load_manifest(manifest_path)
+        assert "_plugins" in manifest
+        meta = manifest["_plugins"]["fixture-plugin"]
+        assert meta["url"] == url
+        assert meta["branch"] == "main"
+        assert meta["subdir"] == ""
+        # imported_at is ISO-8601 with Z suffix
+        assert meta["imported_at"].endswith("Z")
+
+    def test_idempotent_rerun_preserves_plugins_meta(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        first_meta = dict(_CONVERTER.load_manifest(manifest_path)["_plugins"]["fixture-plugin"])
+
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+        second_meta = _CONVERTER.load_manifest(manifest_path)["_plugins"]["fixture-plugin"]
+
+        # url, branch, subdir preserved; imported_at may equal first or differ
+        assert second_meta["url"] == first_meta["url"]
+        assert second_meta["branch"] == first_meta["branch"]
+        assert second_meta["subdir"] == first_meta["subdir"]
+
+    def test_v1_manifest_read_succeeds_then_first_save_adds_plugins_index(
+        self, tmp_path, bare_cc_plugin
+    ):
+        # Hand-construct a v1-shaped manifest (no _plugins key) at the path
+        # the import would write to. Slice 1 readers iterate by entry.get("plugin")
+        # so foreign keys are skipped naturally.
+        hermes_home = tmp_path / "alt-hermes"
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        manifest_path.parent.mkdir(parents=True)
+        # Empty v1 manifest is the minimal repro
+        manifest_path.write_text("{}")
+
+        _CONVERTER.import_plugin(f"file://{bare_cc_plugin}", hermes_home=hermes_home)
+
+        manifest = _CONVERTER.load_manifest(manifest_path)
+        assert "_plugins" in manifest
+        assert "fixture-plugin" in manifest["_plugins"]
+
+    def test_malicious_plugin_json_name_raises(self, tmp_path, bare_upstream):
+        def build_malicious(work: Path) -> None:
+            (work / "plugin.json").write_text('{"name": "../core"}\n')
+            (work / "skills" / "x").mkdir(parents=True)
+            (work / "skills" / "x" / "SKILL.md").write_text("---\nname: x\n---\nx body")
+
+        _push_upstream_change(bare_upstream, tmp_path, "malicious", build_malicious)
+
+        hermes_home = tmp_path / "alt-hermes"
+        with pytest.raises(ValueError, match=r"(?i)plugin_name"):
+            _CONVERTER.import_plugin(f"file://{bare_upstream}", hermes_home=hermes_home)
+        # No skills written under the traversal target
+        assert not (hermes_home / "skills" / ".." / "core").exists()
+
+    def test_subdir_traversal_raises(self, tmp_path, bare_upstream):
+        hermes_home = tmp_path / "alt-hermes"
+        with pytest.raises(ValueError, match=r"(?i)subdir"):
+            _CONVERTER.import_plugin(
+                f"file://{bare_upstream}", subdir="../etc", hermes_home=hermes_home
+            )
