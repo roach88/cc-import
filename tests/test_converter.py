@@ -1048,3 +1048,26 @@ class TestImportPlugin:
                 branch="nonexistent-branch",
                 hermes_home=hermes_home,
             )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 additions: ISO timestamp helper, security validators, hardened
+# clone env, atomic-rename save, manifest v2 _plugins index.
+# ---------------------------------------------------------------------------
+
+
+class TestNowIso:
+    """``_now_iso() -> str`` — ISO-8601 UTC timestamp for ``imported_at``."""
+
+    def test_returns_iso8601_z_format(self):
+        import re
+
+        ts = _CONVERTER._now_iso()
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ts), ts
+
+    def test_returns_current_year_or_later(self):
+        from datetime import datetime
+
+        ts = _CONVERTER._now_iso()
+        parsed = datetime.fromisoformat(ts.rstrip("Z"))
+        assert parsed.year >= 2026
