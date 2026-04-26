@@ -18,7 +18,7 @@ def test_plugin_yaml_is_well_formed() -> None:
     manifest = yaml.safe_load((repo_root / "plugin.yaml").read_text())
 
     assert manifest["name"] == "cc-import"
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.2.0"
     assert manifest["author"] == "Tyler Barstow"
     assert "description" in manifest
     assert isinstance(manifest["description"], str)

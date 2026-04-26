@@ -855,6 +855,80 @@ class TestPruneRemoved:
         assert "plug/still-here" in manifest
         assert dest.exists()
 
+    def test_skill_has_user_changes_src_oserror_is_conservative(self, tmp_path, monkeypatch):
+        """Greptile P1: src rglob OSError must return True (preserve dir).
+
+        The function's docstring contract is "Conservative on I/O errors —
+        returns True so the dir is preserved." The dest rglob branch
+        already does this; the src rglob branch used to return False and
+        let ``remove_import`` rmtree the dir, silently destroying any
+        user-added helper.py / config.yaml. Now both branches honor the
+        contract.
+        """
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "SKILL.md").write_text("upstream")
+
+        dest_dir = tmp_path / "dest"
+        dest_dir.mkdir()
+        (dest_dir / "SKILL.md").write_text("upstream")  # matches origin_hash
+
+        entry = {
+            "origin_hash": _CONVERTER.sha256_file(dest_dir / "SKILL.md"),
+            "source_path": str(src_dir),
+        }
+
+        # Selectively raise OSError on the src enumeration; let the dest
+        # rglob succeed normally so we exercise exactly the branch the
+        # docstring covers.
+        original_rglob = Path.rglob
+
+        def selective_rglob(self, pattern):
+            if str(self) == str(src_dir):
+                raise OSError("simulated unreadable source clone")
+            return original_rglob(self, pattern)
+
+        monkeypatch.setattr(Path, "rglob", selective_rglob)
+
+        assert _CONVERTER._skill_has_user_changes(dest_dir, entry) is True
+
+    def test_user_added_aux_file_preserved_when_upstream_removed(self, tmp_path, caplog):
+        """Greptile P1: prune_removed must use the whole-tree check.
+
+        Slice 1 only compared SKILL.md hashes here, so a user-added
+        ``helper.py`` would be silently destroyed when upstream removed
+        the skill. ``_skill_has_user_changes`` extends the comparison
+        to the whole tree.
+        """
+        import logging
+
+        skills_dir = tmp_path / "skills"
+        src_dir = tmp_path / "src" / "stale"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text("upstream")
+
+        dest = skills_dir / "plug" / "stale"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("upstream")  # SKILL.md unmodified
+        (dest / "helper.py").write_text("# user-added auxiliary file")
+
+        manifest: dict = {
+            "plug/stale": {
+                "plugin": "plug",
+                "kind": "skill",
+                "source_path": str(src_dir),
+                "origin_hash": _CONVERTER.sha256_file(dest / "SKILL.md"),
+            }
+        }
+
+        with caplog.at_level(logging.WARNING):
+            _CONVERTER.prune_removed("plug", set(), manifest, skills_dir)
+
+        assert (dest / "helper.py").exists(), "user-added helper.py was destroyed"
+        assert (dest / "SKILL.md").exists()
+        assert "plug/stale" in manifest
+        assert any("KEEP" in rec.message for rec in caplog.records)
+
 
 @pytest.fixture
 def bare_cc_plugin(tmp_path, bare_upstream):
@@ -1048,3 +1122,545 @@ class TestImportPlugin:
                 branch="nonexistent-branch",
                 hermes_home=hermes_home,
             )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 additions: ISO timestamp helper, security validators, hardened
+# clone env, atomic-rename save, manifest v2 _plugins index.
+# ---------------------------------------------------------------------------
+
+
+class TestNowIso:
+    """``_now_iso() -> str`` — ISO-8601 UTC timestamp for ``imported_at``."""
+
+    def test_returns_iso8601_z_format(self):
+        import re
+
+        ts = _CONVERTER._now_iso()
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", ts), ts
+
+    def test_returns_current_year_or_later(self):
+        from datetime import datetime
+
+        ts = _CONVERTER._now_iso()
+        parsed = datetime.fromisoformat(ts.rstrip("Z"))
+        assert parsed.year >= 2026
+
+
+class TestValidateUrl:
+    """``_validate_url(url)`` — agent-callable installer hardening (R10).
+
+    Allowlist hosts: github.com, gitlab.com, bitbucket.org, codeberg.org.
+    HTTPS only. Rejects file://, git://, ssh://. Raises ``ValueError`` on
+    rejection so tool handlers can convert to a ``tool_error`` with a
+    domain-specific code.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/Foo/Bar.git",
+            "https://gitlab.com/Foo/Bar.git",
+            "https://bitbucket.org/Foo/Bar.git",
+            "https://codeberg.org/Foo/Bar.git",
+            "https://github.com/Foo/Bar",  # no .git suffix
+        ],
+    )
+    def test_allowlisted_hosts_pass(self, url):
+        # No exception
+        _CONVERTER._validate_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.com/payload.git",
+            "https://github.io/Foo/Bar",  # github.io is not github.com
+            "https://raw.githubusercontent.com/Foo/Bar",
+            "https://192.168.1.1/repo.git",
+        ],
+    )
+    def test_disallowed_hosts_raise(self, url):
+        with pytest.raises(ValueError, match=r"(?i)host|allowlist"):
+            _CONVERTER._validate_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///tmp/local-repo",
+            "git://github.com/Foo/Bar.git",
+            "ssh://git@github.com/Foo/Bar.git",
+            "git@github.com:Foo/Bar.git",  # SCP-style SSH
+            "http://github.com/Foo/Bar.git",  # plain HTTP
+        ],
+    )
+    def test_non_https_schemes_raise(self, url):
+        with pytest.raises(ValueError, match=r"(?i)https|scheme"):
+            _CONVERTER._validate_url(url)
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_url("")
+
+    def test_garbage_string_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_url("not a url at all")
+
+    def test_scp_style_url_does_not_leak_in_error_message(self):
+        # SCP-style URL (git@host:org/repo) bypasses urlparse's scheme parser.
+        # The error message must NOT echo the user-supplied URL — that would
+        # let it slip past _redact_paths in the tool handler.
+        scp_url = "git@github.com:Foo/Bar.git"
+        with pytest.raises(ValueError) as excinfo:
+            _CONVERTER._validate_url(scp_url)
+        assert scp_url not in str(excinfo.value)
+        assert "git@github.com" not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user:token@github.com/Foo/Bar.git",
+            "https://ghp_TOKEN@github.com/Foo/Bar.git",  # token-as-username
+            "https://x-access-token:T@github.com/Foo/Bar.git",
+        ],
+    )
+    def test_userinfo_credentials_rejected(self, url):
+        with pytest.raises(ValueError, match=r"(?i)credential"):
+            _CONVERTER._validate_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Greptile P1 (security): _repo_basename of these yields '..',
+            # '.', or '' — clone_dest would then resolve onto the cc-import
+            # state dir or the clones/ root, where clone_or_update's
+            # rmtree-before-clone path would wipe state.json or every
+            # clone cache.
+            "https://github.com/foo/..",  # basename → '..' → state_dir
+            "https://github.com/foo/.",  # basename → '.' → clones root
+            "https://github.com/foo/..git",  # .git-strip → '.' → clones root
+            "https://github.com/foo/.git",  # .git-strip → '' → clones root
+            "https://github.com/.git",  # .git-strip → '' → clones root
+        ],
+    )
+    def test_unsafe_clone_basenames_rejected(self, url):
+        with pytest.raises(ValueError, match=r"(?i)basename|safe"):
+            _CONVERTER._validate_url(url)
+
+
+class TestSanitizeUrl:
+    """``_sanitize_url`` strips userinfo for the slash-command path (R10 belt-and-suspenders)."""
+
+    def test_strips_userinfo(self):
+        assert (
+            _CONVERTER._sanitize_url("https://user:token@github.com/Foo/Bar.git")
+            == "https://github.com/Foo/Bar.git"
+        )
+
+    def test_strips_token_as_username(self):
+        assert (
+            _CONVERTER._sanitize_url("https://ghp_SECRET@github.com/Foo/Bar.git")
+            == "https://github.com/Foo/Bar.git"
+        )
+
+    def test_preserves_port(self):
+        # Port survives the sanitize round-trip
+        assert (
+            _CONVERTER._sanitize_url("https://user:token@example.com:8443/Foo/Bar.git")
+            == "https://example.com:8443/Foo/Bar.git"
+        )
+
+    def test_url_without_userinfo_unchanged(self):
+        url = "https://github.com/Foo/Bar.git"
+        assert _CONVERTER._sanitize_url(url) == url
+
+    def test_non_string_passes_through(self):
+        # Defensive — _sanitize_url is called from import_plugin which has
+        # already validated the input is a string, but be safe.
+        assert _CONVERTER._sanitize_url(None) is None  # type: ignore[arg-type]
+
+
+class TestCloneTimeout:
+    """``_clone_timeout_seconds`` resolves the env-overridable timeout (P1 #3)."""
+
+    def test_default_is_120_seconds(self, monkeypatch):
+        monkeypatch.delenv("CC_IMPORT_CLONE_TIMEOUT", raising=False)
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
+    def test_env_override_accepted(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "300")
+        assert _CONVERTER._clone_timeout_seconds() == 300
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "not-a-number")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
+    def test_zero_or_negative_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "0")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "-5")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
+
+class TestValidatePluginName:
+    """``_validate_plugin_name(name)`` — closes plugin.json traversal gap (R11)."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "compound-engineering",
+            "foo_bar",
+            "foo.v2",
+            "Foo-Bar_v3.0",
+            "a",
+        ],
+    )
+    def test_safe_names_pass(self, name):
+        _CONVERTER._validate_plugin_name(name)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "../core",
+            "..",
+            ".",  # current-dir reference: would resolve plugin_dest to skills_dir itself
+            "...",
+            ".hidden",  # leading dot: hidden dir, surprising under `ls`
+            "/etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "../../../.ssh",
+            "foo bar",  # space
+            "foo:bar",  # colon
+            "-foo",  # leading dash: could be parsed as a flag elsewhere
+            "_internal",  # leading underscore
+        ],
+    )
+    def test_traversal_or_path_chars_raise(self, name):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name(name)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name("")
+
+    def test_non_ascii_raises(self):
+        with pytest.raises(ValueError):
+            _CONVERTER._validate_plugin_name("café")
+
+
+class TestValidateSubdir:
+    """``_validate_subdir(subdir, clone_root)`` — closes path-traversal gap (R11)."""
+
+    def test_empty_subdir_returns_clone_root(self, tmp_path):
+        result = _CONVERTER._validate_subdir("", tmp_path)
+        assert result == tmp_path.resolve()
+
+    def test_relative_subdir_resolves_under_clone_root(self, tmp_path):
+        nested = tmp_path / "plugins" / "foo"
+        nested.mkdir(parents=True)
+        result = _CONVERTER._validate_subdir("plugins/foo", tmp_path)
+        assert result == nested.resolve()
+
+    @pytest.mark.parametrize(
+        "subdir",
+        [
+            "../etc",
+            "..",
+            "/etc/passwd",
+            "plugins/../../etc",
+            "/absolute/path",
+        ],
+    )
+    def test_traversal_raises(self, tmp_path, subdir):
+        with pytest.raises(ValueError, match=r"(?i)subdir|escape|outside"):
+            _CONVERTER._validate_subdir(subdir, tmp_path)
+
+
+class TestSafeCloneEnv:
+    """``_safe_clone_env()`` — hardened env for git clone (R10, CVE-2017-1000117)."""
+
+    def test_includes_no_system_config(self):
+        env = _CONVERTER._safe_clone_env()
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+    def test_disables_global_config(self):
+        import os as _os
+
+        env = _CONVERTER._safe_clone_env()
+        # os.devnull is the portable null device path (POSIX: /dev/null,
+        # Windows: NUL). Slice 2 switched away from a hardcoded "/dev/null".
+        assert env["GIT_CONFIG_GLOBAL"] == _os.devnull
+
+    def test_inherits_path(self, monkeypatch):
+        # PATH must propagate so subprocess can find git
+        monkeypatch.setenv("PATH", "/custom/bin:/usr/bin")
+        env = _CONVERTER._safe_clone_env()
+        assert env["PATH"] == "/custom/bin:/usr/bin"
+
+
+class TestCloneOrUpdateHardening:
+    """``clone_or_update`` security hardening (R10).
+
+    Verifies the clone command argv carries ``--config core.hooksPath=<devnull>``
+    and ``--no-recurse-submodules``, and that all subprocess calls receive
+    the safe env. End-to-end clone success is already covered by slice 1's
+    :class:`TestCloneOrUpdate` against a real bare repo.
+    """
+
+    def test_clone_argv_disables_hooks_and_submodules(self, tmp_path, bare_upstream):
+        import os as _os
+
+        captured: list[list[str]] = []
+        captured_env: list[dict[str, str] | None] = []
+        real_run = subprocess.run
+
+        def spy(cmd, **kwargs):
+            captured.append(list(cmd))
+            captured_env.append(kwargs.get("env"))
+            return real_run(cmd, **kwargs)
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(_CONVERTER.subprocess, "run", side_effect=spy):
+            _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", tmp_path / "dest")
+
+        # First (and only) call on fresh clone is `git clone ...`
+        clone_argv = captured[0]
+        assert clone_argv[0:2] == ["git", "clone"]
+        assert "--no-recurse-submodules" in clone_argv
+        assert "--config" in clone_argv
+        cfg_idx = clone_argv.index("--config")
+        assert clone_argv[cfg_idx + 1] == f"core.hooksPath={_os.devnull}"
+        # Env carries the safe-env vars
+        env = captured_env[0]
+        assert env is not None
+        assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
+        assert env.get("GIT_CONFIG_GLOBAL") == _os.devnull
+
+    def test_fetch_and_reset_use_safe_env(self, tmp_path, bare_upstream):
+        import os as _os
+
+        # First clone (no spy) to set up the cached checkout
+        dest = tmp_path / "dest"
+        _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+
+        # Now spy on the rerun (fetch + reset path)
+        captured_env: list[dict[str, str] | None] = []
+        real_run = subprocess.run
+
+        def spy(cmd, **kwargs):
+            captured_env.append(kwargs.get("env"))
+            return real_run(cmd, **kwargs)
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(_CONVERTER.subprocess, "run", side_effect=spy):
+            _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+
+        # Both fetch and reset should carry the safe env
+        assert len(captured_env) == 2
+        for env in captured_env:
+            assert env is not None
+            assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
+            assert env.get("GIT_CONFIG_GLOBAL") == _os.devnull
+
+
+class TestSaveManifestAtomic:
+    """``save_manifest`` writes via ``.tmp.<uuid>`` + ``os.replace`` for atomicity.
+
+    Slice 1's :class:`TestManifestIO` covers the round-trip + create-parents
+    behavior. This class adds the atomic-rename guarantees and the
+    concurrent-saver collision protection from slice 2 R6 (P2 #5).
+    """
+
+    def test_writes_atomically_with_no_leftover_tmp(self, tmp_path):
+        path = tmp_path / "state.json"
+        _CONVERTER.save_manifest(path, {"x": {"plugin": "y"}})
+        assert path.exists()
+        # No leftover .tmp.<uuid> after success
+        leftovers = list(tmp_path.glob("state.json.tmp.*"))
+        assert leftovers == []
+
+    def test_uses_unique_tmp_filename_per_call(self, tmp_path, monkeypatch):
+        # Two saves should hit different tmp filenames so concurrent savers
+        # from different agent turns don't collide on os.replace.
+        captured: list[Path] = []
+        real_write_text = Path.write_text
+
+        def spy(self_path, *args, **kwargs):
+            if ".tmp." in self_path.name:
+                captured.append(self_path)
+            return real_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+        path = tmp_path / "state.json"
+        _CONVERTER.save_manifest(path, {"a": {"plugin": "p"}})
+        _CONVERTER.save_manifest(path, {"b": {"plugin": "p"}})
+        assert len(captured) == 2
+        assert captured[0] != captured[1]
+        for tmp in captured:
+            assert tmp.name.startswith("state.json.tmp.")
+
+    def test_partial_write_failure_cleans_up_tmp(self, tmp_path, monkeypatch):
+        path = tmp_path / "state.json"
+        # Pre-existing valid manifest
+        _CONVERTER.save_manifest(path, {"original": {"plugin": "p"}})
+        original_content = path.read_text()
+
+        # Simulate disk-full / OSError mid-write. The cleanup logic must
+        # remove the partial .tmp so retries don't leave orphans.
+        real_write_text = Path.write_text
+
+        def boom_on_tmp(self_path, *args, **kwargs):
+            if ".tmp." in self_path.name:
+                # Touch the file first so the cleanup branch has something
+                # to unlink (simulates a partial write that did create the
+                # file before the disk filled up).
+                real_write_text(self_path, "")
+                raise OSError("disk full")
+            return real_write_text(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", boom_on_tmp)
+        with pytest.raises(OSError, match="disk full"):
+            _CONVERTER.save_manifest(path, {"new": {"plugin": "p"}})
+
+        # Canonical state.json untouched
+        assert path.read_text() == original_content
+        # No orphan .tmp.* left behind
+        leftovers = list(tmp_path.glob("state.json.tmp.*"))
+        assert leftovers == []
+
+
+class TestImportPluginSchemaV2:
+    """``import_plugin`` populates ``_plugins`` install cache + validates inputs (R6, R11)."""
+
+    def test_fresh_import_populates_plugins_index(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        manifest = _CONVERTER.load_manifest(manifest_path)
+        assert "_plugins" in manifest
+        meta = manifest["_plugins"]["fixture-plugin"]
+        assert meta["url"] == url
+        assert meta["branch"] == "main"
+        assert meta["subdir"] == ""
+        # imported_at is ISO-8601 with Z suffix
+        assert meta["imported_at"].endswith("Z")
+
+    def test_idempotent_rerun_with_same_args_keeps_meta_aligned(self, tmp_path, bare_cc_plugin):
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        first_meta = dict(_CONVERTER.load_manifest(manifest_path)["_plugins"]["fixture-plugin"])
+
+        _CONVERTER.import_plugin(url, hermes_home=hermes_home)
+        second_meta = _CONVERTER.load_manifest(manifest_path)["_plugins"]["fixture-plugin"]
+
+        # Same args → meta stays the same. Different args would NOT preserve
+        # (see test_rerun_with_different_branch_overwrites_meta below).
+        assert second_meta["url"] == first_meta["url"]
+        assert second_meta["branch"] == first_meta["branch"]
+        assert second_meta["subdir"] == first_meta["subdir"]
+
+    def test_rerun_with_different_branch_overwrites_meta(
+        self, tmp_path, bare_cc_plugin, monkeypatch
+    ):
+        # The behavioral contract: re-importing with a different branch
+        # writes the *new* branch into _plugins. We don't actually clone
+        # a real `dev` branch (setup is heavy and orthogonal to the
+        # contract); monkeypatch clone_or_update to a no-op and verify
+        # the meta-overwrite logic in import_plugin directly.
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+
+        # First import (real clone) on main
+        _CONVERTER.import_plugin(url, branch="main", hermes_home=hermes_home)
+
+        # Second import: stub clone_or_update so we don't need a real `dev`
+        # branch on the bare repo. The clone_dest already exists from the
+        # first import; we just need import_plugin to update _plugins.
+        monkeypatch.setattr(_CONVERTER, "clone_or_update", lambda *a, **kw: None)
+        _CONVERTER.import_plugin(url, branch="dev", hermes_home=hermes_home)
+
+        meta = _CONVERTER.load_manifest(hermes_home / "plugins" / "cc-import" / "state.json")[
+            "_plugins"
+        ]["fixture-plugin"]
+        # _plugins is a derived view: it must reflect the *current* installed
+        # branch, not the first install's branch.
+        assert meta["branch"] == "dev"
+
+    def test_credential_in_url_is_stripped_before_storage(self, bare_cc_plugin):
+        # _validate_url is bypassed by import_plugin (slash-command path),
+        # but _sanitize_url should strip userinfo before writing to _plugins
+        # so a token in a URL never persists in cc-import state. We test
+        # the sanitize helper directly here; the integration is exercised
+        # implicitly by the fresh-import test (which would fail if the
+        # stored URL ever contained userinfo).
+        url_with_token = f"file://x-access-token:secret@{bare_cc_plugin}"
+        sanitized = _CONVERTER._sanitize_url(url_with_token)
+        assert "secret" not in sanitized
+        assert "x-access-token" not in sanitized
+
+    def test_v1_manifest_read_succeeds_then_first_save_adds_plugins_index(
+        self, tmp_path, bare_cc_plugin
+    ):
+        # Hand-construct a v1-shaped manifest (no _plugins key) at the path
+        # the import would write to. Slice 1 readers iterate by entry.get("plugin")
+        # so foreign keys are skipped naturally.
+        hermes_home = tmp_path / "alt-hermes"
+        manifest_path = hermes_home / "plugins" / "cc-import" / "state.json"
+        manifest_path.parent.mkdir(parents=True)
+        # Empty v1 manifest is the minimal repro
+        manifest_path.write_text("{}")
+
+        _CONVERTER.import_plugin(f"file://{bare_cc_plugin}", hermes_home=hermes_home)
+
+        manifest = _CONVERTER.load_manifest(manifest_path)
+        assert "_plugins" in manifest
+        assert "fixture-plugin" in manifest["_plugins"]
+
+    def test_malicious_plugin_json_name_raises(self, tmp_path, bare_upstream):
+        def build_malicious(work: Path) -> None:
+            (work / "plugin.json").write_text('{"name": "../core"}\n')
+            (work / "skills" / "x").mkdir(parents=True)
+            (work / "skills" / "x" / "SKILL.md").write_text("---\nname: x\n---\nx body")
+
+        _push_upstream_change(bare_upstream, tmp_path, "malicious", build_malicious)
+
+        hermes_home = tmp_path / "alt-hermes"
+        with pytest.raises(ValueError, match=r"(?i)plugin_name"):
+            _CONVERTER.import_plugin(f"file://{bare_upstream}", hermes_home=hermes_home)
+        # No skills written under the traversal target
+        assert not (hermes_home / "skills" / ".." / "core").exists()
+
+    def test_subdir_traversal_raises(self, tmp_path, bare_upstream):
+        hermes_home = tmp_path / "alt-hermes"
+        with pytest.raises(ValueError, match=r"(?i)subdir"):
+            _CONVERTER.import_plugin(
+                f"file://{bare_upstream}", subdir="../etc", hermes_home=hermes_home
+            )
+
+    def test_dotdot_basename_url_does_not_wipe_state_dir(self, tmp_path):
+        """Greptile P1 (security): slash command path must reject ..-tailed URLs.
+
+        ``_validate_url`` is bypassed on the slash surface, so the
+        defense-in-depth basename check inside ``import_plugin`` is the
+        only thing standing between a malformed/malicious URL and
+        ``shutil.rmtree`` running against the cc-import state dir.
+        Pre-seed a sentinel under the state dir and assert it survives a
+        rejected import attempt.
+        """
+        hermes_home = tmp_path / "alt-hermes"
+        state_dir = hermes_home / "plugins" / "cc-import"
+        state_dir.mkdir(parents=True)
+        sentinel = state_dir / "state.json"
+        sentinel.write_text('{"_plugins": {"existing": {"branch": "main"}}}')
+
+        with pytest.raises(ValueError, match=r"(?i)basename|safe"):
+            _CONVERTER.import_plugin("https://github.com/foo/..", hermes_home=hermes_home)
+        assert sentinel.exists()
+        assert "existing" in sentinel.read_text()

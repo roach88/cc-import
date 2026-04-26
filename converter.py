@@ -14,15 +14,39 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
+
+
+# Match absolute path-like substrings. Each component starts with at least
+# one path-allowed char (alnum, dot, dash, underscore) so digit-starting
+# components like /proc/1234 / /tmp/456-foo are also redacted. Shared by
+# the slash surface (:mod:`cli`) and the agent tool surface (:mod:`tools`)
+# so error messages don't leak filesystem layout.
+_PATH_RE = re.compile(r"/[\w.][\w./-]*")
+
+
+def _redact_paths(text: str) -> str:
+    """Replace absolute path-like substrings with ``<path>``.
+
+    Exception messages routinely embed filesystem paths
+    (``FileNotFoundError: ...: '/Users/.../state.json'``); leaking those
+    in ``tool_error`` output (or in slash output that may also reach an
+    agent via gateway sessions / transcript replay) lets a prompt-injected
+    agent map the local layout.
+    """
+    return _PATH_RE.sub("<path>", text or "")
+
 
 # Claude Code tool name → Hermes toolset. Covers the common CC tools;
 # unknowns are reported, not dropped. Extend as upstream plugins reveal new
@@ -210,18 +234,55 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write *manifest* to *path* as deterministic, diff-friendly JSON.
+    """Write *manifest* to *path* atomically via ``.tmp.<uuid>`` + ``os.replace``.
 
     Creates parent directories if missing. Output uses ``indent=2`` and
     ``sort_keys=True`` so successive saves produce stable diffs.
+
+    Atomic-rename mitigates torn writes (R6). The tmp filename includes
+    a per-call uuid so two concurrent savers — different agent turns,
+    different processes — write to different tmp files and never
+    collide on ``os.replace``. Single-threaded use is still the
+    documented assumption (last-writer-wins on the final state.json),
+    but this hardens the failure mode from ``FileNotFoundError`` to
+    benign data loss.
+
+    On write failure (disk full, permission error), the partial tmp
+    file is cleaned up so retries don't leave orphans.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp = path.with_suffix(f"{path.suffix}.tmp.{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Git
 # ---------------------------------------------------------------------------
+
+
+def _clone_timeout_seconds() -> int:
+    """Resolve the git-subprocess timeout from env, defaulting to 120s.
+
+    A hung upstream (slow network, stalled server) would otherwise freeze
+    agent tool dispatch indefinitely. The env override exists for slow
+    networks and large historical repos; 120s is the default for the
+    common case of small Claude Code plugin repos on a healthy connection.
+    """
+    raw = os.environ.get("CC_IMPORT_CLONE_TIMEOUT", "")
+    try:
+        value = int(raw)
+        return value if value > 0 else 120
+    except (TypeError, ValueError):
+        return 120
 
 
 def clone_or_update(url: str, branch: str, dest: Path) -> None:
@@ -234,16 +295,27 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
       - ``dest`` exists but is not a git checkout → removed first, then
         cloned (anything inside is discarded — the clone workspace is owned
         by the caller and should not contain user data)
+
+    All three subprocess calls carry a ``timeout=`` so a hung upstream
+    can't freeze agent dispatch. ``subprocess.TimeoutExpired`` propagates
+    to the caller; tool handlers in :mod:`tools` map it to
+    ``tool_error("clone_timeout", ...)``.
     """
+    env = _safe_clone_env()
+    timeout = _clone_timeout_seconds()
     if dest.exists() and (dest / ".git").exists():
         logger.info("Updating plugin repo at %s", dest)
         subprocess.run(
             ["git", "-C", str(dest), "fetch", "--depth=1", "origin", branch],
             check=True,
+            env=env,
+            timeout=timeout,
         )
         subprocess.run(
             ["git", "-C", str(dest), "reset", "--hard", f"origin/{branch}"],
             check=True,
+            env=env,
+            timeout=timeout,
         )
         return
     if dest.exists():
@@ -252,8 +324,21 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
     logger.info("Cloning %s@%s → %s", url, branch, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", "--depth=1", "--branch", branch, url, str(dest)],
+        [
+            "git",
+            "clone",
+            "--depth=1",
+            "--branch",
+            branch,
+            "--no-recurse-submodules",
+            "--config",
+            f"core.hooksPath={os.devnull}",
+            url,
+            str(dest),
+        ],
         check=True,
+        env=env,
+        timeout=timeout,
     )
 
 
@@ -373,6 +458,72 @@ def migrate_agent(
     return "TRANSLATE"
 
 
+def _skill_has_user_changes(dest_dir: Path, entry: dict[str, Any]) -> bool:
+    """Detect user changes inside ``dest_dir`` relative to its source clone.
+
+    Slice 1 only compared ``SKILL.md`` hashes — that misses user-added
+    auxiliary files (``helper.py``, ``config.yaml``) and files the user
+    edited beyond SKILL.md. Slice 2 extends the check to a whole-tree
+    compare against the manifest entry's ``source_path``:
+
+    1. SKILL.md hash differs from ``origin_hash`` → user-modified.
+    2. Any file in ``dest_dir`` not present in ``source_path`` → user-added.
+    3. Any file in both with differing hash → user-modified.
+
+    Falls back to the slice-1 SKILL.md-only result when the source clone
+    is missing or empty (clone cache already pruned, or test fixture
+    didn't seed source files). Conservative on I/O errors — returns
+    True so the dir is preserved.
+    """
+    origin_hash = entry.get("origin_hash")
+    dest_md = dest_dir / "SKILL.md"
+
+    if dest_md.exists() and origin_hash:
+        try:
+            if sha256_file(dest_md) != origin_hash:
+                return True
+        except OSError:
+            return True
+
+    source_path = entry.get("source_path")
+    if not isinstance(source_path, str) or not source_path:
+        return False
+    src_dir = Path(source_path)
+    if not src_dir.exists():
+        return False
+
+    try:
+        src_files = {p.relative_to(src_dir): p for p in src_dir.rglob("*") if p.is_file()}
+    except OSError:
+        # Conservative: src exists but is unreadable (perms change, broken
+        # symlink, NFS failure). We can't prove the dest is unmodified,
+        # so preserve the dir rather than risk shutil.rmtree destroying
+        # user-added auxiliary files. Symmetric with the dest-OSError
+        # branch below.
+        return True
+    if not src_files:
+        # Source has no files to compare — SKILL.md-only check above decided.
+        return False
+
+    try:
+        dest_files = {p.relative_to(dest_dir): p for p in dest_dir.rglob("*") if p.is_file()}
+    except OSError:
+        return True
+
+    # User-added: any file in dest not in src
+    if any(rel not in src_files for rel in dest_files):
+        return True
+    # User-modified: hash differs for any file in both. Files only in src
+    # (deleted by user) don't count — we're about to remove the dir anyway.
+    for rel, dest_file in dest_files.items():
+        try:
+            if sha256_file(dest_file) != sha256_file(src_files[rel]):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def prune_removed(
     plugin: str,
     seen_keys: set[str],
@@ -383,22 +534,23 @@ def prune_removed(
 
     Iterates manifest entries scoped to ``plugin`` that were *not* observed
     during this sync (i.e., not in ``seen_keys``). For each such stale
-    entry: if the on-disk file is unmodified relative to the recorded
-    ``origin_hash``, delete it and pop the manifest entry; otherwise log a
-    KEEP warning and retain both file and manifest entry. If the file has
-    already been deleted out from under us, the manifest entry is popped
-    cleanly.
+    entry: if the on-disk tree is unmodified relative to the recorded
+    source (whole-tree check via :func:`_skill_has_user_changes` —
+    SKILL.md hash plus user-added auxiliary files like ``helper.py`` /
+    ``config.yaml``), delete it and pop the manifest entry; otherwise log
+    a KEEP warning and retain both file and manifest entry. If the file
+    has already been deleted out from under us, the manifest entry is
+    popped cleanly.
     """
     stale = [k for k, v in manifest.items() if v.get("plugin") == plugin and k not in seen_keys]
     for key in stale:
         entry = manifest[key]
-        dest_md = skills_dir / key / "SKILL.md"
+        dest_dir = skills_dir / key
+        dest_md = dest_dir / "SKILL.md"
         if dest_md.exists():
-            local_hash = sha256_file(dest_md)
-            if local_hash != entry["origin_hash"]:
+            if _skill_has_user_changes(dest_dir, entry):
                 logger.warning("KEEP (user-modified, upstream removed): %s", key)
                 continue
-            dest_dir = skills_dir / key
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
             logger.info("REMOVE (upstream deleted): %s", key)
@@ -420,6 +572,159 @@ class ImportSummary:
     agents_translated: int = 0
     agents_unchanged: int = 0
     skipped_user_modified: list[str] = field(default_factory=list)
+
+
+def _now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 ``...Z`` string.
+
+    Used for ``imported_at`` on manifest entries. Format is fixed at
+    seconds precision with a trailing ``Z`` so successive saves produce
+    stable, sortable, jq-friendly timestamps.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Hostnames an agent-callable installer is allowed to clone from. Slice 2
+# hardcodes the most common public Git hosts. Slice 3 may surface a config
+# override; for now slash-command users bypass this check entirely.
+_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {"github.com", "gitlab.com", "bitbucket.org", "codeberg.org"}
+)
+
+
+def _validate_url(url: str) -> None:
+    """Validate *url* for agent-callable use (R10). Raises ``ValueError`` on rejection.
+
+    Four layered checks:
+      1. URL must be a non-empty HTTPS string. Anything else (file://,
+         git://, ssh://, scp-style ``git@host:org/repo``, plain http://)
+         raises with a "https" or "scheme" hint.
+      2. URL must parse to a hostname. Empty or unparseable values raise.
+      3. URL must NOT carry userinfo (``https://user:token@host/...``).
+         Embedded credentials would persist in ``_plugins[plugin].url``
+         and re-enter agent context on every ``cc_import_list`` call —
+         a real exfil vector via prompt injection.
+      4. Hostname must be on :data:`_ALLOWED_HOSTS`. Anything else raises
+         with an "allowlist" hint so tool handlers can surface
+         ``tool_error("disallowed_host", ...)``.
+
+    Slash command callers do **not** invoke this — they're considered
+    human-vetted. Tool handlers in :mod:`tools` do.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("git_url is required and must be a non-empty string")
+    if not url.startswith("https://"):
+        # Don't echo the user-supplied URL in the error message. tool_error
+        # surfaces this and a malicious SCP-style URL (git@host:org/repo)
+        # would slip past _redact_paths.
+        raise ValueError(
+            "git_url must use the https:// scheme. SCP-style and other "
+            "non-HTTPS URLs are not permitted."
+        )
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("git_url has no parseable hostname")
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "git_url must not embed credentials (user:token@host). "
+            "Use Hermes's credential layer or git's credential helper for "
+            "private repos; tokens in URLs persist in cc-import state."
+        )
+    if host not in _ALLOWED_HOSTS:
+        raise ValueError(
+            f"git_url host {host!r} is not on the allowlist ({', '.join(sorted(_ALLOWED_HOSTS))})"
+        )
+    # R11: reject URLs whose derived clone basename would escape the clones/
+    # subtree. _repo_basename on ``https://github.com/foo/..`` yields ``..``
+    # → ``clone_dest = clones/..`` resolves to the cc-import state dir,
+    # where clone_or_update's "exists but not a git checkout" branch runs
+    # ``shutil.rmtree(dest)`` BEFORE clone — wiping state.json. ``foo/.``
+    # and ``foo/.git``-stripped-to-``""`` collapse onto the clones/ root
+    # itself, wiping every plugin's clone cache. Same character class as
+    # _validate_plugin_name since both end up as directory names.
+    basename = _repo_basename(url)
+    if not basename or not _PLUGIN_NAME_RE.match(basename):
+        raise ValueError(
+            f"git_url derives unsafe clone basename {basename!r} "
+            "(must start with alphanumeric and contain only [A-Za-z0-9._-])"
+        )
+
+
+def _sanitize_url(url: str) -> str:
+    """Return *url* with any userinfo (``user:token@``) stripped.
+
+    Belt-and-suspenders for the slash-command path: ``_validate_url``
+    already rejects userinfo on the agent surface, but the slash command
+    bypasses validation. Sanitize before storing in the ``_plugins``
+    install-cache to ensure no surface accidentally persists credentials.
+    """
+    if not isinstance(url, str) or "@" not in url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.username and not parsed.password:
+        return url
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+# First char must be alphanumeric (not a dot, dash, or underscore). This
+# rejects the special directory entries '.', '..', '.hidden', as well as
+# names that would be hidden in `ls` or behave oddly under shell globs.
+_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_plugin_name(name: str) -> None:
+    """Reject plugin names that could escape ``$HERMES_HOME/skills/`` (R11).
+
+    The name is used as a directory under ``skills/``, so any path-special
+    character would let a malicious ``plugin.json`` write outside the
+    intended subtree. We require an alphanumeric leading character, then
+    only ASCII letters/digits/dot/dash/underscore — which together reject
+    ``.``, ``..``, ``.hidden``, and shell-meta-character names.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("plugin_name is required and must be a non-empty string")
+    if not _PLUGIN_NAME_RE.match(name):
+        raise ValueError(
+            f"plugin_name {name!r} contains disallowed characters (only [A-Za-z0-9._-] permitted)"
+        )
+
+
+def _safe_clone_env() -> dict[str, str]:
+    """Return an env dict that suppresses git's system + global config (R10).
+
+    The env vars only suppress system and global git config — they do not
+    suppress hooks. Hook suppression comes from the
+    ``--config core.hooksPath=...`` flag passed to ``git clone``, which
+    persists into the cloned repo's ``.git/config`` and is therefore
+    inherited by subsequent fetch/reset operations on that repo. With
+    ``--no-recurse-submodules`` added on the clone argv, this combination
+    addresses the CVE-2017-1000117 vector class.
+    """
+    return {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+
+
+def _validate_subdir(subdir: str, clone_root: Path) -> Path:
+    """Resolve *subdir* against *clone_root* and assert it stays inside (R11).
+
+    Returns the resolved absolute path on success. Raises ``ValueError`` if
+    the resolved path escapes the clone root via ``..`` or absolute-path
+    components. ``subdir=""`` is treated as the clone root itself.
+    """
+    if not isinstance(subdir, str):
+        raise ValueError("subdir must be a string")
+    root = clone_root.resolve()
+    candidate = (clone_root / subdir).resolve() if subdir else root
+    if not (candidate == root or candidate.is_relative_to(root)):
+        raise ValueError(f"subdir {subdir!r} resolves outside clone root {clone_root}")
+    return candidate
 
 
 def _resolve_hermes_home(hermes_home: Path | None) -> Path:
@@ -477,14 +782,45 @@ def import_plugin(
     manifest_path = state_dir / "state.json"
 
     repo_basename = _repo_basename(git_url)
+    # R11: defense-in-depth basename check. Slash command bypasses
+    # ``_validate_url`` (which already enforces this on the agent surface),
+    # so re-validate here before constructing ``clone_dest`` — a basename
+    # like ``..`` or ``.`` would otherwise resolve clone_dest onto the
+    # cc-import state dir or the clones/ root, where clone_or_update's
+    # rmtree-before-clone path would wipe it.
+    if not repo_basename or not _PLUGIN_NAME_RE.match(repo_basename):
+        raise ValueError(
+            f"git_url derives unsafe clone basename {repo_basename!r} "
+            "(must start with alphanumeric and contain only [A-Za-z0-9._-])"
+        )
     clone_dest = clone_root / repo_basename
 
     clone_or_update(git_url, branch, clone_dest)
 
-    plugin_root = clone_dest / subdir if subdir else clone_dest
+    # R11: validate subdir against the resolved clone root before any read.
+    plugin_root = _validate_subdir(subdir, clone_dest)
     plugin_name = _resolve_plugin_name(plugin_root, repo_basename)
+    # R11: validate plugin name (could come from a malicious plugin.json)
+    # before using it as a directory under skills_dir.
+    _validate_plugin_name(plugin_name)
 
     manifest = load_manifest(manifest_path)
+    # R6: install-cache index. Always reflect the *current* call's source
+    # parameters — the index is a derived view of what's installed right
+    # now, not a record of the first install. (Preserving stale values
+    # under idempotent-rerun would silently lie when a user re-imports
+    # the same plugin on a different branch.) Slice 3's sources.yaml
+    # becomes the canonical user-intent store; this stays the derived
+    # cache. URL is sanitized to strip any userinfo (token@host) — see
+    # _sanitize_url's docstring for the exfil-via-list rationale.
+    plugins_index = manifest.setdefault("_plugins", {})
+    plugins_index[plugin_name] = {
+        "url": _sanitize_url(git_url),
+        "branch": branch,
+        "subdir": subdir,
+        "imported_at": _now_iso(),
+    }
+
     summary = ImportSummary(plugin=plugin_name)
     seen_keys: set[str] = set()
 
