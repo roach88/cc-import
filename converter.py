@@ -497,6 +497,24 @@ def _validate_plugin_name(name: str) -> None:
         )
 
 
+def _validate_subdir(subdir: str, clone_root: Path) -> Path:
+    """Resolve *subdir* against *clone_root* and assert it stays inside (R11).
+
+    Returns the resolved absolute path on success. Raises ``ValueError`` if
+    the resolved path escapes the clone root via ``..`` or absolute-path
+    components. ``subdir=""`` is treated as the clone root itself.
+    """
+    if not isinstance(subdir, str):
+        raise ValueError("subdir must be a string")
+    root = clone_root.resolve()
+    candidate = (clone_root / subdir).resolve() if subdir else root
+    if not (candidate == root or candidate.is_relative_to(root)):
+        raise ValueError(
+            f"subdir {subdir!r} resolves outside clone root {clone_root}"
+        )
+    return candidate
+
+
 def _resolve_hermes_home(hermes_home: Path | None) -> Path:
     if hermes_home is not None:
         return hermes_home
