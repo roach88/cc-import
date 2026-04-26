@@ -1218,3 +1218,66 @@ class TestSafeCloneEnv:
         monkeypatch.setenv("PATH", "/custom/bin:/usr/bin")
         env = _CONVERTER._safe_clone_env()
         assert env["PATH"] == "/custom/bin:/usr/bin"
+
+
+class TestCloneOrUpdateHardening:
+    """``clone_or_update`` security hardening (R10).
+
+    Verifies the clone command argv carries ``--config core.hooksPath=/dev/null``
+    and ``--no-recurse-submodules``, and that all subprocess calls receive
+    the safe env. End-to-end clone success is already covered by slice 1's
+    :class:`TestCloneOrUpdate` against a real bare repo.
+    """
+
+    def test_clone_argv_disables_hooks_and_submodules(self, tmp_path, bare_upstream):
+        captured: list[list[str]] = []
+        captured_env: list[dict[str, str] | None] = []
+        real_run = subprocess.run
+
+        def spy(cmd, **kwargs):
+            captured.append(list(cmd))
+            captured_env.append(kwargs.get("env"))
+            return real_run(cmd, **kwargs)
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(_CONVERTER.subprocess, "run", side_effect=spy):
+            _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", tmp_path / "dest")
+
+        # First (and only) call on fresh clone is `git clone ...`
+        clone_argv = captured[0]
+        assert clone_argv[0:2] == ["git", "clone"]
+        assert "--no-recurse-submodules" in clone_argv
+        assert "--config" in clone_argv
+        cfg_idx = clone_argv.index("--config")
+        assert clone_argv[cfg_idx + 1] == "core.hooksPath=/dev/null"
+        # Env carries the safe-env vars
+        env = captured_env[0]
+        assert env is not None
+        assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
+        assert env.get("GIT_CONFIG_GLOBAL") == "/dev/null"
+
+    def test_fetch_and_reset_use_safe_env(self, tmp_path, bare_upstream):
+        # First clone (no spy) to set up the cached checkout
+        dest = tmp_path / "dest"
+        _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+
+        # Now spy on the rerun (fetch + reset path)
+        captured_env: list[dict[str, str] | None] = []
+        real_run = subprocess.run
+
+        def spy(cmd, **kwargs):
+            captured_env.append(kwargs.get("env"))
+            return real_run(cmd, **kwargs)
+
+        import unittest.mock as _mock
+
+        with _mock.patch.object(_CONVERTER.subprocess, "run", side_effect=spy):
+            _CONVERTER.clone_or_update(f"file://{bare_upstream}", "main", dest)
+
+        # Both fetch and reset should carry the safe env
+        assert len(captured_env) == 2
+        for env in captured_env:
+            assert env is not None
+            assert env.get("GIT_CONFIG_NOSYSTEM") == "1"
+            assert env.get("GIT_CONFIG_GLOBAL") == "/dev/null"
