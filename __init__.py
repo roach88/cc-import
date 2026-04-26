@@ -15,37 +15,49 @@ works in interactive sessions and gateway adapters.
 
 from __future__ import annotations
 
-# Three-tier ``cli`` import:
+# Three-tier import for ``cli`` and ``tools``:
 #
 # 1. Hermes loads this plugin as a namespace-package member (sets
 #    ``module.__package__`` and ``module.__path__`` before exec), so the
 #    relative import succeeds in production.
-# 2. Tests in ``tests/test_cli.py`` load ``__init__.py`` via
-#    ``importlib.util`` after inserting the repo root into ``sys.path``,
-#    so the absolute fallback finds ``cli.py``.
+# 2. Tests load ``__init__.py`` via ``importlib.util`` after inserting
+#    the repo root into ``sys.path``, so the absolute fallback finds
+#    ``cli.py`` / ``tools.py``.
 # 3. Pytest's :class:`_pytest.python.Package` setup eagerly imports any
 #    ``__init__.py`` it finds at the rootpath without package context
 #    AND without inserting the repo root into ``sys.path``. Both prior
-#    fallbacks fail; ``cli`` is set to ``None`` so module load completes
+#    fallbacks fail; the modules are set to ``None`` so load completes
 #    cleanly. ``register()`` is never invoked in that context, so the
-#    ``None`` value is harmless.
+#    ``None`` values are harmless.
 try:
-    from . import cli
+    from . import cli, tools
 except ImportError:
     try:
         import cli  # type: ignore[no-redef]
+        import tools  # type: ignore[no-redef]
     except ModuleNotFoundError:
         cli = None  # type: ignore[assignment]
+        tools = None  # type: ignore[assignment]
 
 
 def register(ctx) -> None:
-    """Register cc-import's slash command with the Hermes plugin loader."""
+    """Register cc-import's slash command and agent tools with Hermes."""
     ctx.register_command(
         name="cc-import",
         handler=cli.handle_command,
         description=(
             "Import Claude Code plugins (skills + agents) into Hermes. "
-            "Subcommand: install <git-url> [--branch BRANCH] [--subdir SUBDIR]."
+            "Subcommands: install <git-url> [--branch BRANCH] [--subdir SUBDIR], "
+            "list [--json], remove <plugin> [--force] [--dry-run]."
         ),
-        args_hint="install <git-url>",
+        args_hint="install <git-url> | list | remove <plugin>",
     )
+    for name, schema, handler, emoji in tools.TOOLS:
+        ctx.register_tool(
+            name=name,
+            toolset="cc_import",
+            schema=schema,
+            handler=handler,
+            description=schema["description"],
+            emoji=emoji,
+        )
