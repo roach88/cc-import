@@ -234,6 +234,22 @@ def save_manifest(path: Path, manifest: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _clone_timeout_seconds() -> int:
+    """Resolve the git-subprocess timeout from env, defaulting to 120s.
+
+    A hung upstream (slow network, stalled server) would otherwise freeze
+    agent tool dispatch indefinitely. The env override exists for slow
+    networks and large historical repos; 120s is the default for the
+    common case of small Claude Code plugin repos on a healthy connection.
+    """
+    raw = os.environ.get("CC_IMPORT_CLONE_TIMEOUT", "")
+    try:
+        value = int(raw)
+        return value if value > 0 else 120
+    except (TypeError, ValueError):
+        return 120
+
+
 def clone_or_update(url: str, branch: str, dest: Path) -> None:
     """Clone *url*@*branch* into *dest*, or fetch + reset if already cloned.
 
@@ -244,19 +260,27 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
       - ``dest`` exists but is not a git checkout → removed first, then
         cloned (anything inside is discarded — the clone workspace is owned
         by the caller and should not contain user data)
+
+    All three subprocess calls carry a ``timeout=`` so a hung upstream
+    can't freeze agent dispatch. ``subprocess.TimeoutExpired`` propagates
+    to the caller; tool handlers in :mod:`tools` map it to
+    ``tool_error("clone_timeout", ...)``.
     """
     env = _safe_clone_env()
+    timeout = _clone_timeout_seconds()
     if dest.exists() and (dest / ".git").exists():
         logger.info("Updating plugin repo at %s", dest)
         subprocess.run(
             ["git", "-C", str(dest), "fetch", "--depth=1", "origin", branch],
             check=True,
             env=env,
+            timeout=timeout,
         )
         subprocess.run(
             ["git", "-C", str(dest), "reset", "--hard", f"origin/{branch}"],
             check=True,
             env=env,
+            timeout=timeout,
         )
         return
     if dest.exists():
@@ -279,6 +303,7 @@ def clone_or_update(url: str, branch: str, dest: Path) -> None:
         ],
         check=True,
         env=env,
+        timeout=timeout,
     )
 
 
@@ -468,12 +493,16 @@ _ALLOWED_HOSTS: frozenset[str] = frozenset(
 def _validate_url(url: str) -> None:
     """Validate *url* for agent-callable use (R10). Raises ``ValueError`` on rejection.
 
-    Three layered checks:
+    Four layered checks:
       1. URL must be a non-empty HTTPS string. Anything else (file://,
          git://, ssh://, scp-style ``git@host:org/repo``, plain http://)
          raises with a "https" or "scheme" hint.
       2. URL must parse to a hostname. Empty or unparseable values raise.
-      3. Hostname must be on :data:`_ALLOWED_HOSTS`. Anything else raises
+      3. URL must NOT carry userinfo (``https://user:token@host/...``).
+         Embedded credentials would persist in ``_plugins[plugin].url``
+         and re-enter agent context on every ``cc_import_list`` call —
+         a real exfil vector via prompt injection.
+      4. Hostname must be on :data:`_ALLOWED_HOSTS`. Anything else raises
          with an "allowlist" hint so tool handlers can surface
          ``tool_error("disallowed_host", ...)``.
 
@@ -494,10 +523,35 @@ def _validate_url(url: str) -> None:
     host = (parsed.hostname or "").lower()
     if not host:
         raise ValueError("git_url has no parseable hostname")
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "git_url must not embed credentials (user:token@host). "
+            "Use Hermes's credential layer or git's credential helper for "
+            "private repos; tokens in URLs persist in cc-import state."
+        )
     if host not in _ALLOWED_HOSTS:
         raise ValueError(
             f"git_url host {host!r} is not on the allowlist ({', '.join(sorted(_ALLOWED_HOSTS))})"
         )
+
+
+def _sanitize_url(url: str) -> str:
+    """Return *url* with any userinfo (``user:token@``) stripped.
+
+    Belt-and-suspenders for the slash-command path: ``_validate_url``
+    already rejects userinfo on the agent surface, but the slash command
+    bypasses validation. Sanitize before storing in the ``_plugins``
+    install-cache to ensure no surface accidentally persists credentials.
+    """
+    if not isinstance(url, str) or "@" not in url:
+        return url
+    parsed = urlparse(url)
+    if not parsed.username and not parsed.password:
+        return url
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
 
 
 # First char must be alphanumeric (not a dot, dash, or underscore). This
@@ -624,15 +678,19 @@ def import_plugin(
     _validate_plugin_name(plugin_name)
 
     manifest = load_manifest(manifest_path)
-    # R6: install-cache index. Preserve url/branch/subdir on rerun;
-    # always refresh imported_at. Slice 3's sources.yaml will become the
-    # canonical user-intent store; this remains the derived cache.
+    # R6: install-cache index. Always reflect the *current* call's source
+    # parameters — the index is a derived view of what's installed right
+    # now, not a record of the first install. (Preserving stale values
+    # under idempotent-rerun would silently lie when a user re-imports
+    # the same plugin on a different branch.) Slice 3's sources.yaml
+    # becomes the canonical user-intent store; this stays the derived
+    # cache. URL is sanitized to strip any userinfo (token@host) — see
+    # _sanitize_url's docstring for the exfil-via-list rationale.
     plugins_index = manifest.setdefault("_plugins", {})
-    existing = plugins_index.get(plugin_name, {})
     plugins_index[plugin_name] = {
-        "url": existing.get("url", git_url),
-        "branch": existing.get("branch", branch),
-        "subdir": existing.get("subdir", subdir),
+        "url": _sanitize_url(git_url),
+        "branch": branch,
+        "subdir": subdir,
         "imported_at": _now_iso(),
     }
 

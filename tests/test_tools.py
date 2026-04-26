@@ -108,6 +108,20 @@ class TestHandleInstall:
         assert out["error"] == "clone_failed"
         assert "128" in out.get("message", "")
 
+    def test_clone_timeout_returns_clone_timeout_error(self, monkeypatch):
+        # subprocess.TimeoutExpired propagates from clone_or_update; the
+        # handler must map it to a distinct tool_error code so the agent
+        # can surface "the network is slow / try again later" cleanly
+        # without confusing it with a hard clone failure.
+        def fake_import(*_a, **_kw):
+            raise subprocess.TimeoutExpired(cmd=["git", "clone"], timeout=120)
+
+        monkeypatch.setattr(_TOOLS.converter, "import_plugin", fake_import)
+        out = _result(_TOOLS._handle_install({"git_url": "https://github.com/Foo/Bar.git"}))
+        assert out["error"] == "clone_timeout"
+        assert "120" in out.get("message", "")
+        assert "CC_IMPORT_CLONE_TIMEOUT" in out.get("message", "")
+
     def test_validator_value_error_from_import_plugin_returns_invalid_arg(self, monkeypatch):
         # _validate_plugin_name / _validate_subdir raise ValueError inside import_plugin
         def fake_import(*_a, **_kw):

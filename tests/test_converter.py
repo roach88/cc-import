@@ -1141,6 +1141,72 @@ class TestValidateUrl:
         assert scp_url not in str(excinfo.value)
         assert "git@github.com" not in str(excinfo.value)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user:token@github.com/Foo/Bar.git",
+            "https://ghp_TOKEN@github.com/Foo/Bar.git",  # token-as-username
+            "https://x-access-token:T@github.com/Foo/Bar.git",
+        ],
+    )
+    def test_userinfo_credentials_rejected(self, url):
+        with pytest.raises(ValueError, match=r"(?i)credential"):
+            _CONVERTER._validate_url(url)
+
+
+class TestSanitizeUrl:
+    """``_sanitize_url`` strips userinfo for the slash-command path (R10 belt-and-suspenders)."""
+
+    def test_strips_userinfo(self):
+        assert (
+            _CONVERTER._sanitize_url("https://user:token@github.com/Foo/Bar.git")
+            == "https://github.com/Foo/Bar.git"
+        )
+
+    def test_strips_token_as_username(self):
+        assert (
+            _CONVERTER._sanitize_url("https://ghp_SECRET@github.com/Foo/Bar.git")
+            == "https://github.com/Foo/Bar.git"
+        )
+
+    def test_preserves_port(self):
+        # Port survives the sanitize round-trip
+        assert (
+            _CONVERTER._sanitize_url("https://user:token@example.com:8443/Foo/Bar.git")
+            == "https://example.com:8443/Foo/Bar.git"
+        )
+
+    def test_url_without_userinfo_unchanged(self):
+        url = "https://github.com/Foo/Bar.git"
+        assert _CONVERTER._sanitize_url(url) == url
+
+    def test_non_string_passes_through(self):
+        # Defensive — _sanitize_url is called from import_plugin which has
+        # already validated the input is a string, but be safe.
+        assert _CONVERTER._sanitize_url(None) is None  # type: ignore[arg-type]
+
+
+class TestCloneTimeout:
+    """``_clone_timeout_seconds`` resolves the env-overridable timeout (P1 #3)."""
+
+    def test_default_is_120_seconds(self, monkeypatch):
+        monkeypatch.delenv("CC_IMPORT_CLONE_TIMEOUT", raising=False)
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
+    def test_env_override_accepted(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "300")
+        assert _CONVERTER._clone_timeout_seconds() == 300
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "not-a-number")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
+    def test_zero_or_negative_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "0")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+        monkeypatch.setenv("CC_IMPORT_CLONE_TIMEOUT", "-5")
+        assert _CONVERTER._clone_timeout_seconds() == 120
+
 
 class TestValidatePluginName:
     """``_validate_plugin_name(name)`` — closes plugin.json traversal gap (R11)."""
@@ -1352,7 +1418,7 @@ class TestImportPluginSchemaV2:
         # imported_at is ISO-8601 with Z suffix
         assert meta["imported_at"].endswith("Z")
 
-    def test_idempotent_rerun_preserves_plugins_meta(self, tmp_path, bare_cc_plugin):
+    def test_idempotent_rerun_with_same_args_keeps_meta_aligned(self, tmp_path, bare_cc_plugin):
         hermes_home = tmp_path / "alt-hermes"
         url = f"file://{bare_cc_plugin}"
         _CONVERTER.import_plugin(url, hermes_home=hermes_home)
@@ -1363,10 +1429,50 @@ class TestImportPluginSchemaV2:
         _CONVERTER.import_plugin(url, hermes_home=hermes_home)
         second_meta = _CONVERTER.load_manifest(manifest_path)["_plugins"]["fixture-plugin"]
 
-        # url, branch, subdir preserved; imported_at may equal first or differ
+        # Same args → meta stays the same. Different args would NOT preserve
+        # (see test_rerun_with_different_branch_overwrites_meta below).
         assert second_meta["url"] == first_meta["url"]
         assert second_meta["branch"] == first_meta["branch"]
         assert second_meta["subdir"] == first_meta["subdir"]
+
+    def test_rerun_with_different_branch_overwrites_meta(
+        self, tmp_path, bare_cc_plugin, monkeypatch
+    ):
+        # The behavioral contract: re-importing with a different branch
+        # writes the *new* branch into _plugins. We don't actually clone
+        # a real `dev` branch (setup is heavy and orthogonal to the
+        # contract); monkeypatch clone_or_update to a no-op and verify
+        # the meta-overwrite logic in import_plugin directly.
+        hermes_home = tmp_path / "alt-hermes"
+        url = f"file://{bare_cc_plugin}"
+
+        # First import (real clone) on main
+        _CONVERTER.import_plugin(url, branch="main", hermes_home=hermes_home)
+
+        # Second import: stub clone_or_update so we don't need a real `dev`
+        # branch on the bare repo. The clone_dest already exists from the
+        # first import; we just need import_plugin to update _plugins.
+        monkeypatch.setattr(_CONVERTER, "clone_or_update", lambda *a, **kw: None)
+        _CONVERTER.import_plugin(url, branch="dev", hermes_home=hermes_home)
+
+        meta = _CONVERTER.load_manifest(hermes_home / "plugins" / "cc-import" / "state.json")[
+            "_plugins"
+        ]["fixture-plugin"]
+        # _plugins is a derived view: it must reflect the *current* installed
+        # branch, not the first install's branch.
+        assert meta["branch"] == "dev"
+
+    def test_credential_in_url_is_stripped_before_storage(self, bare_cc_plugin):
+        # _validate_url is bypassed by import_plugin (slash-command path),
+        # but _sanitize_url should strip userinfo before writing to _plugins
+        # so a token in a URL never persists in cc-import state. We test
+        # the sanitize helper directly here; the integration is exercised
+        # implicitly by the fresh-import test (which would fail if the
+        # stored URL ever contained userinfo).
+        url_with_token = f"file://x-access-token:secret@{bare_cc_plugin}"
+        sanitized = _CONVERTER._sanitize_url(url_with_token)
+        assert "secret" not in sanitized
+        assert "x-access-token" not in sanitized
 
     def test_v1_manifest_read_succeeds_then_first_save_adds_plugins_index(
         self, tmp_path, bare_cc_plugin

@@ -113,6 +113,14 @@ def _handle_install(args: dict[str, Any], **_kwargs: Any) -> str:
 
         try:
             summary = converter.import_plugin(git_url, branch=branch, subdir=subdir)
+        except subprocess.TimeoutExpired as exc:
+            return tool_error(
+                "clone_timeout",
+                _redact_paths(
+                    f"git clone exceeded timeout ({exc.timeout}s) for {git_url}; "
+                    "raise CC_IMPORT_CLONE_TIMEOUT or check upstream availability"
+                ),
+            )
         except subprocess.CalledProcessError as exc:
             return tool_error(
                 "clone_failed",
